@@ -4,7 +4,7 @@ import math
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal, Optional, Tuple, Any
+from typing import Any, Literal, Optional, Tuple
 
 import h5py
 import numpy as np
@@ -22,11 +22,7 @@ from torchmetrics.utilities.data import dim_zero_cat, select_topk
 
 
 class ParallelLinear(nn.Module):
-    """Parallelly apply multiple linear layers.
-
-    For a two-dimensional vector
-    y_i = Linear_i(x_i)
-    """
+    """Parallelly apply multiple linear layers."""
 
     def __init__(self, in_features: int, out_features: int, n_parallel: int):
         super().__init__()
@@ -142,43 +138,60 @@ class TopKMultilabelAUROC(torchmetrics.classification.MultilabelPrecisionRecallC
 class BarspoonTransformer(pl.LightningModule):
     def __init__(
         self,
-        in_features: int,
-        out_features: int,
-        pos_weight: torch.Tensor,
+        d_features: int,
+        n_targets: int,
+        *,
+        pos_weight: Optional[torch.Tensor] = None,
+        # model parameters
+        d_model: int = 512,
+        n_encoder_heads: int = 8,
+        n_decoder_heads: int = 8,
+        n_encoder_steps: int = 2,
+        # other hparams
         learning_rate: float = 1e-4,
         **hparams: Any,
     ) -> None:
         super().__init__()
-        _ = hparams # 
-
-        d_model: int = 512
-        nhead: int = 8
-        num_encoder_layers: int = 2
+        _ = hparams  # so we don't get unused parameter warnings
 
         self.learning_rate = learning_rate
 
         # one class token per output class
-        self.class_tokens = nn.Parameter(torch.rand(out_features, d_model))
+        self.class_tokens = nn.Parameter(torch.rand(n_targets, d_model))
 
-        self.projector = nn.Sequential(nn.Linear(in_features, d_model), nn.ReLU())
+        self.projector = nn.Sequential(nn.Linear(d_features, d_model), nn.ReLU())
 
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model, nhead, batch_first=True, norm_first=True
+        self.first_decoder = nn.TransformerDecoderLayer(
+            d_model, n_decoder_heads, batch_first=True, norm_first=True
         )
-        encoder_norm = nn.LayerNorm(d_model)
-        self.encoder_stack = nn.TransformerEncoder(
-            encoder_layer,
-            num_encoder_layers,
-            norm=encoder_norm,
+        self.encoder_decoder_pairs = nn.ModuleList(
+            [
+                nn.ModuleDict(
+                    {
+                        "encoder": nn.TransformerEncoderLayer(
+                            d_model, n_encoder_heads, batch_first=True, norm_first=True
+                        ),
+                        "decoder": nn.TransformerDecoderLayer(
+                            d_model, n_decoder_heads, batch_first=True, norm_first=True
+                        ),
+                    }
+                )
+                for _ in range(n_encoder_steps)
+            ]
         )
         self.heads = ParallelLinear(
-            in_features=d_model, out_features=1, n_parallel=out_features
+            in_features=d_model, out_features=1, n_parallel=n_targets
+        )
+        # TODO maybe we need a norm???
+
+        self.heads = ParallelLinear(
+            in_features=d_model, out_features=1, n_parallel=n_targets
         )
 
         metrics = torchmetrics.MetricCollection(
             [
                 TopKMultilabelAUROC(
-                    num_labels=out_features, topk=max(int(out_features * 0.2), 1)
+                    num_labels=n_targets, topk=max(int(n_targets * 0.2), 1)
                 )
             ]
         )
@@ -189,23 +202,19 @@ class BarspoonTransformer(pl.LightningModule):
 
         self.save_hyperparameters()
 
-    def forward(self, bag):
-        batch_size, _, _ = bag.shape
-        projected = self.projector(bag)  # shape: [bs, seq_len, d_model]
+    def forward(self, tile_tokens):
+        batch_size, _, _ = tile_tokens.shape
+        tile_tokens = self.projector(tile_tokens)  # shape: [bs, seq_len, d_model]
 
-        # prepend class tokens
-        out_features, d_model = self.class_tokens.shape
-        with_class_tokens = torch.cat(
-            [
-                self.class_tokens[None, :, :].expand(batch_size, out_features, d_model),
-                projected,
-            ],
-            dim=1,
+        class_tokens = self.first_decoder(
+            tgt=self.class_tokens.expand(batch_size, -1, -1), memory=tile_tokens
         )
-        encoded = self.encoder_stack(with_class_tokens)
+        for layer in self.encoder_decoder_pairs:
+            tile_tokens = layer["encoder"](tile_tokens)
+            class_tokens = layer["decoder"](tgt=class_tokens, memory=tile_tokens)
 
         # apply the corresponding head to each class token
-        logits = self.heads(encoded[:, :out_features, :]).squeeze(-1)
+        logits = self.heads(class_tokens).squeeze(-1)
 
         return logits
 
@@ -240,9 +249,9 @@ class BarspoonTransformer(pl.LightningModule):
         return self.step(batch, step_name="test")
 
     def predict_step(self, batch, batch_idx, dataloader_idx=0):
-            bag, targets = batch
-            logits = self(bag)
-            return torch.sigmoid(logits), targets
+        bag, targets = batch
+        logits = self(bag)
+        return torch.sigmoid(logits), targets
 
     def configure_optimizers(self):
         optimizer = torch.optim.Adam(self.parameters(), lr=self.learning_rate)
@@ -258,15 +267,15 @@ def read_table(path: Path, dtype=str) -> pd.DataFrame:
 
 batch_size = 2
 clini_df = read_table(
-    "/home/mvantreeck/Downloads/gecco-multilabel/CLINI_Gecco_All_v6_MG.xlsx"
+    "/mnt/bulk/mvantreeck/gecco/gecco-multilabel/CLINI_Gecco_All_v6_MG.xlsx"
 )
 slide_df = read_table(
-    "/home/mvantreeck/Downloads/gecco-multilabel/SLIDE_GECCO_IWHS.csv"
+    "/mnt/bulk/mvantreeck/gecco/gecco-multilabel/SLIDE_GECCO_IWHS.csv"
 )[["PATIENT", "FILENAME"]]
 df = clini_df.merge(slide_df, on="PATIENT")
 assert not df.empty, "no overlap between clini and slide table."
 
-feature_dir = Path("/home/mvantreeck/Downloads/gecco-multilabel/IWHS")
+feature_dir = Path("/mnt/bulk/mvantreeck/gecco/gecco-multilabel/IWHS")
 # remove slides we don't have
 h5s = set(feature_dir.glob("*.h5"))
 assert h5s, f"no features found in {feature_dir}!"
@@ -280,7 +289,7 @@ cohort_df = patient_df.merge(
     patient_slides, left_on="PATIENT", right_index=True
 ).reset_index()
 
-with open("/home/mvantreeck/Downloads/gecco-multilabel/targets_1.txt") as targets_file:
+with open("/mnt/bulk/mvantreeck/gecco/gecco-multilabel/targets_1.txt") as targets_file:
     target_labels = np.array([target_label.strip() for target_label in targets_file])
 
 target_labels = target_labels[cohort_df[target_labels].nunique(dropna=True) == 2]
@@ -294,8 +303,31 @@ pos_weight = neg_samples / pos_samples
 
 
 def get_splits(X, n_splits: int = 6):
-    splitter = KFold(n_splits=n_splits)
-    folds = np.array([fold for _, fold in splitter.split(X=X)], dtype=object)
+    # splitter = KFold(n_splits=n_splits)
+    # folds = np.array([fold for _, fold in splitter.split(X=X)], dtype=object)
+    # for test_fold, test_fold_idxs in enumerate(folds):
+    #     val_fold = (test_fold + 1) % n_splits
+    #     val_fold_idxs = folds[val_fold]
+
+    #     train_folds = set(range(n_splits)) - {test_fold, val_fold}
+    #     train_fold_idxs = np.concatenate(folds[list(train_folds)])
+
+    #     yield (
+    #         train_fold_idxs.astype(int),
+    #         val_fold_idxs.astype(int),
+    #         test_fold_idxs.astype(int),
+    #     )
+
+    folds = []
+    for fold_no in range(n_splits):
+        checkpoint_path = next(
+            Path(f"/mnt/bulk/mvantreeck/gecco/vit-results/lorem-{fold_no=}").glob(
+                "**/checkpoint-*.ckpt"
+            )
+        )
+        test_patients = torch.load(checkpoint_path)["hyper_parameters"]["test_patients"]
+        folds.append(cohort_df.index[cohort_df.PATIENT.isin(test_patients)].values)
+    folds = np.array(folds)
     for test_fold, test_fold_idxs in enumerate(folds):
         val_fold = (test_fold + 1) % n_splits
         val_fold_idxs = folds[val_fold]
@@ -308,6 +340,7 @@ def get_splits(X, n_splits: int = 6):
             val_fold_idxs.astype(int),
             test_fold_idxs.astype(int),
         )
+
 
 # %%
 for fold_no, (train_idx, valid_idx, test_idx) in enumerate(get_splits(X=targets)):
@@ -333,11 +366,11 @@ for fold_no, (train_idx, valid_idx, test_idx) in enumerate(get_splits(X=targets)
     test_dl = DataLoader(test_ds, batch_size=1, num_workers=8)
 
     example_bags, _ = next(iter(train_dl))
-    in_features = example_bags.size(-1)
+    d_features = example_bags.size(-1)
 
     model = BarspoonTransformer(
-        in_features=in_features,
-        out_features=len(target_labels),
+        d_features=d_features,
+        n_targets=len(target_labels),
         pos_weight=pos_weight,
         # other hparams
         target_labels=list(target_labels),
@@ -347,7 +380,7 @@ for fold_no, (train_idx, valid_idx, test_idx) in enumerate(get_splits(X=targets)
     )
 
     trainer = pl.Trainer(
-        default_root_dir=f"lorem-{fold_no=}",
+        default_root_dir=f"/mnt/bulk/mvantreeck/gecco/interleaved/lorem-{fold_no=}",
         callbacks=[
             EarlyStopping(monitor="val_TopKMultilabelAUROC", mode="max", patience=16),
             ModelCheckpoint(
@@ -365,70 +398,70 @@ for fold_no, (train_idx, valid_idx, test_idx) in enumerate(get_splits(X=targets)
     trainer.test(model=model, dataloaders=test_dl)
 # %%
 
-from sklearn.metrics import roc_auc_score
+# from sklearn.metrics import roc_auc_score
 
-def get_aurocs(bags, targets):
-    predict_ds = BagDataset(
-        bags, targets, instances_per_bag=2**12, deterministic=True
-    )
-    predict_dl = DataLoader(predict_ds, batch_size=1, num_workers=8)
-    trainer = pl.Trainer(
-        default_root_dir=f"ipsum",
-        max_epochs=1,
-        accelerator="auto",
-        devices=1,
-    )
-    x = trainer.predict(model, predict_dl)
+# def get_aurocs(bags, targets):
+#     predict_ds = BagDataset(
+#         bags, targets, instances_per_bag=2**12, deterministic=True
+#     )
+#     predict_dl = DataLoader(predict_ds, batch_size=1, num_workers=8)
+#     trainer = pl.Trainer(
+#         default_root_dir=f"ipsum",
+#         max_epochs=1,
+#         accelerator="auto",
+#         devices=1,
+#     )
+#     x = trainer.predict(model, predict_dl)
 
-    scores = torch.stack([scores.squeeze(-2) for scores, _ in x])
-    targets = torch.stack([targets.squeeze(-2) for _, targets in x])
+#     scores = torch.stack([scores.squeeze(-2) for scores, _ in x])
+#     targets = torch.stack([targets.squeeze(-2) for _, targets in x])
 
-    predict_aurocs = {}
-    for target_label, t, s in zip(target_labels, targets.transpose(0,1), scores.transpose(0,1), strict=True):
-        if (t == 1).all() or (t == 0).all():
-            continue
-        predict_aurocs[target_label] = roc_auc_score(t, s)
+#     predict_aurocs = {}
+#     for target_label, t, s in zip(target_labels, targets.transpose(0,1), scores.transpose(0,1), strict=True):
+#         if (t == 1).all() or (t == 0).all():
+#             continue
+#         predict_aurocs[target_label] = roc_auc_score(t, s)
 
-    return predict_aurocs
+#     return predict_aurocs
 
+# # %%
+# aurocs = {}
+# for fold_no in range(6):
+#     model_path = next(Path(f"lorem-{fold_no=}/lightning_logs/version_0/checkpoints").glob("checkpoint-*.ckpt"))
+#     model = BarspoonTransformer.load_from_checkpoint(model_path)
+#     for part in ["valid_patients", "test_patients"]:
+#         test_df = cohort_df[cohort_df.PATIENT.isin(model.hparams[part])]
+#         targets = torch.Tensor(test_df[model.hparams["target_labels"]].apply(pd.to_numeric).values)
+#         bags = test_df.slide_path.values
 
-# %%
-aurocs = {}
-for fold_no in range(6):
-    model_path = next(Path(f"lorem-{fold_no=}/lightning_logs/version_0/checkpoints").glob("checkpoint-*.ckpt"))
-    model = BarspoonTransformer.load_from_checkpoint(model_path)
-    for part in ["valid_patients", "test_patients"]:
-        test_df = cohort_df[cohort_df.PATIENT.isin(model.hparams[part])]
-        targets = torch.Tensor(test_df[model.hparams["target_labels"]].apply(pd.to_numeric).values)
-        bags = test_df.slide_path.values
+#         aurocs[(fold_no, part)] = get_aurocs(bags, targets)
+# # %%
+# import matplotlib.pyplot as plt
+# import numpy as np
 
-        aurocs[(fold_no, part)] = get_aurocs(bags, targets)
-# %%
-import matplotlib.pyplot as plt
-import numpy as np
+# fig, ax = plt.subplots(subplot_kw={"aspect": "equal"})
+# ax.plot([.3,1], [.3,1], 'r--')
+# for target_label in target_labels:
+#     test_scores = [aurocs[fold_no, "test_patients"].get(target_label) for fold_no in range(6)]
+#     marugoto_scores = []
+#     try:
+#         for fold_no in range(5):
+#             df = pd.read_csv(f"/mnt/bulk/mvantreeck/gecco/gecco-marugoto-results/{target_label}/fold-{fold_no}/patient-preds.csv")
+#             marugoto_scores.append(roc_auc_score(df[target_label], df[f"{target_label}_1"]))
+#     except Exception:
+#         continue
+#     if None in (set(marugoto_scores) | set(test_scores)):
+#         continue
+#     # if min(valid_scores) < .6:
+#     #     continue
 
-fig, ax = plt.subplots(subplot_kw={"aspect": "equal"})
-ax.plot([.3,1], [.3,1], 'r--')
-for target_label in target_labels:
-    test_scores = [aurocs[fold_no, "test_patients"].get(target_label) for fold_no in range(6)]
-    marugoto_scores = []
-    try:
-        for fold_no in range(5):
-            df = pd.read_csv(f"/home/mvantreeck/Downloads/gecco-marugoto-results/{target_label}/fold-{fold_no}/patient-preds.csv")
-            marugoto_scores.append(roc_auc_score(df[target_label], df[f"{target_label}_1"]))
-    except Exception:
-        continue
-    if None in (set(marugoto_scores) | set(test_scores)):
-        continue
-    # if min(valid_scores) < .6:
-    #     continue
+#     plt.scatter([np.mean(marugoto_scores)], [np.mean(test_scores)], marker='.')
 
-    plt.scatter([np.mean(marugoto_scores)], [np.mean(test_scores)], marker='.')
-
-ax.set_aspect("equal")
-plt.title("Median AUROC for GECCO IWHS Crossval")
-plt.xlabel("marugoto")
-plt.ylabel("multilabel")
-plt.hlines([.5], .3, 1, ['r'], linestyles='dotted')
-plt.vlines([.5], .3, 1, ['r'], linestyles='dotted')
+# ax.set_aspect("equal")
+# plt.title("Median AUROC for GECCO IWHS Crossval")
+# plt.xlabel("marugoto")
+# plt.ylabel("multilabel")
+# plt.hlines([.5], .3, 1, ['r'], linestyles='dotted')
+# plt.vlines([.5], .3, 1, ['r'], linestyles='dotted')
+# # %%
 # %%
