@@ -134,6 +134,117 @@ class TopKMultilabelAUROC(torchmetrics.classification.MultilabelPrecisionRecallC
             state, self.topk, average=self.average, thresholds=None
         )
 
+class ViTransformer(pl.LightningModule):
+    def __init__(
+        self,
+        d_features: int,
+        n_targets: int,
+        pos_weight: Optional[torch.Tensor],
+        *,
+        learning_rate: float = 1e-4,
+        d_model: int = 512,
+        nhead: int = 8,
+        num_encoder_layers: int = 2,
+        **hparams: Any,
+    ) -> None:
+        super().__init__()
+        _ = hparams
+
+        self.learning_rate = learning_rate
+
+        # one class token per output class
+        self.class_tokens = nn.Parameter(torch.rand(n_targets, d_model))
+
+        self.projector = nn.Sequential(nn.Linear(d_features, d_model), nn.ReLU())
+
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model, nhead, batch_first=True, norm_first=True
+        )
+        encoder_norm = nn.LayerNorm(d_model)
+        self.encoder_stack = nn.TransformerEncoder(
+            encoder_layer,
+            num_encoder_layers,
+            norm=encoder_norm,
+        )
+        self.heads = ParallelLinear(
+            in_features=d_model, out_features=1, n_parallel=n_targets
+        )
+
+        metrics = torchmetrics.MetricCollection(
+            [
+                TopKMultilabelAUROC(
+                    num_labels=n_targets, topk=max(int(n_targets * 0.2), 1)
+                )
+            ]
+        )
+        for step in ["train", "val", "test"]:
+            setattr(self, f"{step}_metrics", metrics.clone(prefix=f"{step}_"))
+
+
+        self.pos_weight = pos_weight
+
+        self.save_hyperparameters()
+
+    def forward(self, bag):
+        batch_size, _, _ = bag.shape
+        projected = self.projector(bag)  # shape: [bs, seq_len, d_model]
+
+        # prepend class tokens
+        out_features, d_model = self.class_tokens.shape
+        with_class_tokens = torch.cat(
+            [
+                self.class_tokens[None, :, :].expand(batch_size, out_features, d_model),
+                projected,
+            ],
+            dim=1,
+        )
+        encoded = self.encoder_stack(with_class_tokens)
+
+        # apply the corresponding head to each class token
+        logits = self.heads(encoded[:, :out_features, :]).squeeze(-1)
+
+        return logits
+
+    def step(self, batch, step_name=None):
+        bag, target = batch
+        logits = self(bag)
+        loss = F.binary_cross_entropy_with_logits(
+            logits,
+            target,
+            pos_weight=self.pos_weight.type_as(target),
+            reduction="none",
+        ).nanmean()
+        if step_name:
+            metrics = getattr(self, f"{step_name}_metrics")
+            metrics.update(logits, target.long())
+            self.log_dict(
+                metrics, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True
+            )
+
+            self.log(
+                f"{step_name}_loss", loss, on_step=True, on_epoch=True, sync_dist=True
+            )
+
+        return loss
+
+    def training_step(self, batch, batch_idx):
+        return self.step(batch, step_name="train")
+
+    def validation_step(self, batch, batch_idx):
+        return self.step(batch, step_name="val")
+
+    def test_step(self, batch, batch_idx):
+        return self.step(batch, step_name="test")
+
+    def predict_step(self, batch, batch_idx, dataloader_idx=0):
+        bag, targets = batch
+        logits = self(bag)
+        return torch.sigmoid(logits), targets
+
+    def configure_optimizers(self):
+        optimizer = torch.optim.Adam(self.parameters(), lr=self.learning_rate)
+        return optimizer
+
 
 class BarspoonTransformer(pl.LightningModule):
     def __init__(
@@ -141,7 +252,7 @@ class BarspoonTransformer(pl.LightningModule):
         d_features: int,
         n_targets: int,
         *,
-        pos_weight: Optional[torch.Tensor] = None,
+        pos_weight: Optional[torch.Tensor],
         # model parameters
         d_model: int = 512,
         n_encoder_heads: int = 8,
