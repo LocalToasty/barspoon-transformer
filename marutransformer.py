@@ -134,6 +134,7 @@ class TopKMultilabelAUROC(torchmetrics.classification.MultilabelPrecisionRecallC
             state, self.topk, average=self.average, thresholds=None
         )
 
+
 class ViTransformer(pl.LightningModule):
     def __init__(
         self,
@@ -179,7 +180,6 @@ class ViTransformer(pl.LightningModule):
         )
         for step in ["train", "val", "test"]:
             setattr(self, f"{step}_metrics", metrics.clone(prefix=f"{step}_"))
-
 
         self.pos_weight = pos_weight
 
@@ -247,6 +247,16 @@ class ViTransformer(pl.LightningModule):
 
 
 class BarspoonTransformer(pl.LightningModule):
+    """
+             ┏━━┓     ┏━━┓          ┏━━┓
+    t ────┬─▶┃E1┠──┬─▶┃E2┠──┬──···─▶┃En┠──┐
+          │  ┗━━┛  │  ┗━━┛  │       ┗━━┛  │
+          ▼        ▼        ▼             ▼
+        ┏━━┓     ┏━━┓     ┏━━┓          ┏━━┓  ┏━━┓
+    c ─▶┃D0┠────▶┃D1┠────▶┃D2┠─···─────▶┃Dn┠─▶┃FC┠─▶ s
+        ┗━━┛     ┗━━┛     ┗━━┛          ┗━━┛  ┗━━┛
+    """
+
     def __init__(
         self,
         d_features: int,
