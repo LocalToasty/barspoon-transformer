@@ -179,7 +179,7 @@ class ViTransformer(pl.LightningModule):
             ]
         )
         for step in ["train", "val", "test"]:
-            setattr(self, f"{step}_metrics", metrics.clone(prefix=f"{step}_"))
+            setattr(self, f"{step}_global_metrics", metrics.clone(prefix=f"{step}_"))
 
         self.pos_weight = pos_weight
 
@@ -213,7 +213,7 @@ class ViTransformer(pl.LightningModule):
             target,
             pos_weight=self.pos_weight.type_as(target),
             reduction="none",
-        ).nanmean()
+        ).nansum()
         if step_name:
             metrics = getattr(self, f"{step_name}_metrics")
             metrics.update(logits, target.long())
@@ -262,6 +262,7 @@ class BarspoonTransformer(pl.LightningModule):
         d_features: int,
         n_targets: int,
         *,
+        target_labels: Sequence[str],
         pos_weight: Optional[torch.Tensor],
         # model parameters
         d_model: int = 512,
@@ -309,16 +310,33 @@ class BarspoonTransformer(pl.LightningModule):
             in_features=d_model, out_features=1, n_parallel=n_targets
         )
 
-        metrics = torchmetrics.MetricCollection(
+        # use the same metrics for training, validation and testing
+        global_metrics = torchmetrics.MetricCollection(
             [
                 TopKMultilabelAUROC(
                     num_labels=n_targets, topk=max(int(n_targets * 0.2), 1)
                 )
             ]
         )
-        for step in ["train", "val", "test"]:
-            setattr(self, f"{step}_metrics", metrics.clone(prefix=f"{step}_"))
+        target_aurocs = torchmetrics.MetricCollection(
+            {
+                target_label: torchmetrics.AUROC(task="binary")
+                for target_label in target_labels
+            }
+        )
+        for step_name in ["train", "val", "test"]:
+            setattr(
+                self,
+                f"{step_name}_global_metrics",
+                global_metrics.clone(prefix=f"{step_name}_"),
+            )
+            setattr(
+                self,
+                f"{step_name}_target_aurocs",
+                target_aurocs.clone(prefix=f"{step_name}_"),
+            )
 
+        self.target_labels = target_labels
         self.pos_weight = pos_weight
 
         self.save_hyperparameters()
@@ -340,23 +358,46 @@ class BarspoonTransformer(pl.LightningModule):
         return logits
 
     def step(self, batch, step_name=None):
-        bag, target = batch
-        logits = self(bag)
+        bags, targets = batch
+        logits = self(bags)
+        # BCE ignoring the positions we don't have target labels for
         loss = F.binary_cross_entropy_with_logits(
             logits,
-            target,
-            pos_weight=self.pos_weight.type_as(target),
+            targets,
+            pos_weight=self.pos_weight.type_as(targets),
             reduction="none",
-        ).nanmean()
+        ).nansum()
         if step_name:
-            metrics = getattr(self, f"{step_name}_metrics")
-            metrics.update(logits, target.long())
+            # update global metrics
+            global_metrics = getattr(self, f"{step_name}_global_metrics")
+            global_metrics.update(logits, targets.long())
             self.log_dict(
-                metrics, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True
+                global_metrics,
+                on_step=False,
+                on_epoch=True,
+                prog_bar=True,
+                sync_dist=True,
             )
             self.log(
                 f"{step_name}_loss", loss, on_step=True, on_epoch=True, sync_dist=True
             )
+
+            # update target-wise metrics
+            for target_label, target_logits, target_ys in zip(
+                self.target_labels,
+                logits.permute(-1, -2),
+                targets.permute(-1, -2),
+                strict=True,
+            ):
+                target_auroc = getattr(self, f"{step_name}_target_aurocs")[target_label]
+                target_auroc.update(target_logits, target_ys)
+                self.log(
+                    f"{step_name}_{target_label}_auroc",
+                    target_auroc,
+                    on_step=False,
+                    on_epoch=True,
+                    sync_dist=True,
+                )
 
         return loss
 
@@ -386,7 +427,7 @@ def read_table(path: Path, dtype=str) -> pd.DataFrame:
         return pd.read_excel(path, dtype=dtype)
 
 
-batch_size = 2
+batch_size = 4
 clini_df = read_table(
     "/mnt/bulk/mvantreeck/gecco/gecco-multilabel/CLINI_Gecco_All_v6_MG.xlsx"
 )
