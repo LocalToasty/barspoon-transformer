@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 # %%
 import math
+import re
+import shutil
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -248,13 +250,13 @@ class ViTransformer(pl.LightningModule):
 
 class BarspoonTransformer(pl.LightningModule):
     """
-             ┏━━┓     ┏━━┓          ┏━━┓
-    t ────┬─▶┃E1┠──┬─▶┃E2┠──┬──···─▶┃En┠──┐
-          │  ┗━━┛  │  ┗━━┛  │       ┗━━┛  │
-          ▼        ▼        ▼             ▼
-        ┏━━┓     ┏━━┓     ┏━━┓          ┏━━┓  ┏━━┓
-    c ─▶┃D0┠────▶┃D1┠────▶┃D2┠─···─────▶┃Dn┠─▶┃FC┠─▶ s
-        ┗━━┛     ┗━━┛     ┗━━┛          ┗━━┛  ┗━━┛
+        ┏━━┓     ┏━━┓          ┏━━┓
+    t ─▶┃E0┠──┬─▶┃E1┠──┬──···─▶┃En┠──┐
+        ┗━━┛  │  ┗━━┛  │       ┗━━┛  │
+              ▼        ▼             ▼
+            ┏━━┓     ┏━━┓          ┏━━┓  ┏━━┓
+    c ─────▶┃D0┠────▶┃D1┠─···─────▶┃Dn┠─▶┃FC┠─▶ s
+            ┗━━┛     ┗━━┛          ┗━━┛  ┗━━┛
     """
 
     def __init__(
@@ -268,7 +270,8 @@ class BarspoonTransformer(pl.LightningModule):
         d_model: int = 512,
         n_encoder_heads: int = 8,
         n_decoder_heads: int = 8,
-        n_encoder_steps: int = 2,
+        n_layers: int = 2,
+        dim_feedforward: int = 2048,
         # other hparams
         learning_rate: float = 1e-4,
         **hparams: Any,
@@ -283,29 +286,30 @@ class BarspoonTransformer(pl.LightningModule):
 
         self.projector = nn.Sequential(nn.Linear(d_features, d_model), nn.ReLU())
 
-        self.first_decoder = nn.TransformerDecoderLayer(
-            d_model, n_decoder_heads, batch_first=True, norm_first=True
-        )
         self.encoder_decoder_pairs = nn.ModuleList(
             [
                 nn.ModuleDict(
                     {
                         "encoder": nn.TransformerEncoderLayer(
-                            d_model, n_encoder_heads, batch_first=True, norm_first=True
+                            d_model,
+                            n_encoder_heads,
+                            dim_feedforward=dim_feedforward,
+                            batch_first=True,
+                            norm_first=True,
                         ),
                         "decoder": nn.TransformerDecoderLayer(
-                            d_model, n_decoder_heads, batch_first=True, norm_first=True
+                            d_model,
+                            n_decoder_heads,
+                            dim_feedforward=dim_feedforward,
+                            batch_first=True,
+                            norm_first=True,
                         ),
                     }
                 )
-                for _ in range(n_encoder_steps)
+                for _ in range(n_layers)
             ]
         )
-        self.heads = ParallelLinear(
-            in_features=d_model, out_features=1, n_parallel=n_targets
-        )
         # TODO maybe we need a norm???
-
         self.heads = ParallelLinear(
             in_features=d_model, out_features=1, n_parallel=n_targets
         )
@@ -320,7 +324,7 @@ class BarspoonTransformer(pl.LightningModule):
         )
         target_aurocs = torchmetrics.MetricCollection(
             {
-                target_label: torchmetrics.AUROC(task="binary")
+                sanatize(target_label): torchmetrics.AUROC(task="binary")
                 for target_label in target_labels
             }
         )
@@ -343,11 +347,10 @@ class BarspoonTransformer(pl.LightningModule):
 
     def forward(self, tile_tokens):
         batch_size, _, _ = tile_tokens.shape
-        tile_tokens = self.projector(tile_tokens)  # shape: [bs, seq_len, d_model]
 
-        class_tokens = self.first_decoder(
-            tgt=self.class_tokens.expand(batch_size, -1, -1), memory=tile_tokens
-        )
+        tile_tokens = self.projector(tile_tokens)  # shape: [bs, seq_len, d_model]
+        class_tokens = self.class_tokens.expand(batch_size, -1, -1)
+
         for layer in self.encoder_decoder_pairs:
             tile_tokens = layer["encoder"](tile_tokens)
             class_tokens = layer["decoder"](tgt=class_tokens, memory=tile_tokens)
@@ -389,7 +392,9 @@ class BarspoonTransformer(pl.LightningModule):
                 targets.permute(-1, -2),
                 strict=True,
             ):
-                target_auroc = getattr(self, f"{step_name}_target_aurocs")[target_label]
+                target_auroc = getattr(self, f"{step_name}_target_aurocs")[
+                    sanatize(target_label)
+                ]
                 target_auroc.update(target_logits, target_ys)
                 self.log(
                     f"{step_name}_{target_label}_auroc",
@@ -420,6 +425,10 @@ class BarspoonTransformer(pl.LightningModule):
         return optimizer
 
 
+def sanatize(x: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_]", "_", x)
+
+
 def read_table(path: Path, dtype=str) -> pd.DataFrame:
     if Path(path).suffix == ".csv":
         return pd.read_csv(path, dtype=dtype)
@@ -427,9 +436,10 @@ def read_table(path: Path, dtype=str) -> pd.DataFrame:
         return pd.read_excel(path, dtype=dtype)
 
 
-batch_size = 4
+batch_size = 2
 clini_df = read_table(
-    "/mnt/bulk/mvantreeck/gecco/gecco-multilabel/CLINI_Gecco_All_v6_MG.xlsx"
+    "/mnt/bulk/mvantreeck/gecco/gecco-multilabel/CLINI_Gecco_All_v6_MG.xlsx",
+    dtype={"PATIENT": str},
 )
 slide_df = read_table(
     "/mnt/bulk/mvantreeck/gecco/gecco-multilabel/SLIDE_GECCO_IWHS.csv"
@@ -455,7 +465,11 @@ with open("/mnt/bulk/mvantreeck/gecco/gecco-multilabel/targets_1.txt") as target
     target_labels = np.array([target_label.strip() for target_label in targets_file])
 
 target_labels = target_labels[cohort_df[target_labels].nunique(dropna=True) == 2]
-# TODO print dropped labels
+target_labels = (
+    cohort_df[target_labels]
+    .select_dtypes(["int16", "int32", "int64", "float16", "float32", "float64"])
+    .columns.values
+)
 
 targets = torch.Tensor(cohort_df[target_labels].apply(pd.to_numeric).values)
 bags = cohort_df.slide_path.values
@@ -465,7 +479,7 @@ pos_weight = neg_samples / pos_samples
 
 
 def get_splits(X, n_splits: int = 6):
-    # splitter = KFold(n_splits=n_splits)
+    # splitter = KFold(n_splits=n_splits, shuffle=True)
     # folds = np.array([fold for _, fold in splitter.split(X=X)], dtype=object)
     # for test_fold, test_fold_idxs in enumerate(folds):
     #     val_fold = (test_fold + 1) % n_splits
@@ -480,15 +494,10 @@ def get_splits(X, n_splits: int = 6):
     #         test_fold_idxs.astype(int),
     #     )
 
-    folds = []
-    for fold_no in range(n_splits):
-        checkpoint_path = next(
-            Path(f"/mnt/bulk/mvantreeck/gecco/vit-results/lorem-{fold_no=}").glob(
-                "**/checkpoint-*.ckpt"
-            )
-        )
-        test_patients = torch.load(checkpoint_path)["hyper_parameters"]["test_patients"]
-        folds.append(cohort_df.index[cohort_df.PATIENT.isin(test_patients)].values)
+    folds = [
+        cohort_df.index[cohort_df.PATIENT.isin(test_patients)].values
+        for test_patients in np.load("folds.npy")
+    ]
     folds = np.array(folds)
     for test_fold, test_fold_idxs in enumerate(folds):
         val_fold = (test_fold + 1) % n_splits
@@ -505,59 +514,119 @@ def get_splits(X, n_splits: int = 6):
 
 
 # %%
-for fold_no, (train_idx, valid_idx, test_idx) in enumerate(get_splits(X=targets)):
-    train_ds = BagDataset(
-        bags[train_idx],
-        targets[train_idx],
-        instances_per_bag=2**10,
-        deterministic=False,
-    )
-    train_dl = DataLoader(train_ds, batch_size=batch_size, num_workers=8, shuffle=True)
+# np.load("folds.npy")[0]
+# %%
 
-    valid_ds = BagDataset(
-        bags[valid_idx],
-        targets[valid_idx],
-        instances_per_bag=2**10,
-        deterministic=True,
-    )
-    valid_dl = DataLoader(valid_ds, batch_size=batch_size, num_workers=8)
+# %%
+hparam_grid = [
+    {
+        "n_encoder_heads": n_encoder_heads,
+        "n_decoder_heads": n_decoder_heads,
+        "n_layers": n_layers,
+        "dim_feedforward": dim_feedforward,
+        "d_model": d_model,
+    }
+    for n_encoder_heads in [8, 16]
+    for n_decoder_heads in [8, 16]
+    for n_layers in [1, 2, 4, 6]
+    for dim_feedforward in [1024, 2048]
+    for d_model in [256, 512]
+]
+import random
 
-    test_ds = BagDataset(
-        bags[test_idx], targets[test_idx], instances_per_bag=2**12, deterministic=True
-    )
-    test_dl = DataLoader(test_ds, batch_size=1, num_workers=8)
+random.shuffle(hparam_grid)
+# %%
+fold_no = 0
+for hparams in hparam_grid:
+    n_encoder_heads = hparams["n_encoder_heads"]
+    n_decoder_heads = hparams["n_decoder_heads"]
+    n_layers = hparams["n_layers"]
+    d_model = hparams["d_model"]
+    dim_feedforward = hparams["dim_feedforward"]
+    for fold_no, (train_idx, valid_idx, test_idx) in enumerate(get_splits(X=targets)):
+        print(f"{hparams=}, {fold_no=}")
+        root_dir = Path(
+            f"/mnt/bulk/mvantreeck/gecco/interleaved/{n_layers=}-{n_encoder_heads=}-{n_decoder_heads=}-{d_model=}-{dim_feedforward=}/{fold_no=}"
+        )
+        if (root_dir / "done").exists():
+            # already done... skip
+            continue
+        elif root_dir.exists():
+            # failed; start over
+            shutil.rmtree(root_dir)
 
-    example_bags, _ = next(iter(train_dl))
-    d_features = example_bags.size(-1)
+        train_ds = BagDataset(
+            bags[train_idx],
+            targets[train_idx],
+            instances_per_bag=2**10,
+            deterministic=False,
+        )
+        train_dl = DataLoader(
+            train_ds, batch_size=batch_size, num_workers=8, shuffle=True
+        )
 
-    model = BarspoonTransformer(
-        d_features=d_features,
-        n_targets=len(target_labels),
-        pos_weight=pos_weight,
-        # other hparams
-        target_labels=list(target_labels),
-        train_patients=list(cohort_df.loc[train_idx].PATIENT),
-        valid_patients=list(cohort_df.loc[valid_idx].PATIENT),
-        test_patients=list(cohort_df.loc[test_idx].PATIENT),
-    )
+        valid_ds = BagDataset(
+            bags[valid_idx],
+            targets[valid_idx],
+            instances_per_bag=2**10,
+            deterministic=True,
+        )
+        valid_dl = DataLoader(valid_ds, batch_size=batch_size, num_workers=8)
 
-    trainer = pl.Trainer(
-        default_root_dir=f"/mnt/bulk/mvantreeck/gecco/interleaved/lorem-{fold_no=}",
-        callbacks=[
-            EarlyStopping(monitor="val_TopKMultilabelAUROC", mode="max", patience=16),
-            ModelCheckpoint(
-                monitor="val_TopKMultilabelAUROC",
-                mode="max",
-                filename="checkpoint-{epoch:02d}-{val_TopKMultilabelAUROC:0.3f}",
-            ),
-        ],
-        accelerator="auto",
-        accumulate_grad_batches=32 // batch_size,
-        gradient_clip_val=0.5,
-    )
+        test_ds = BagDataset(
+            bags[test_idx],
+            targets[test_idx],
+            instances_per_bag=2**12,
+            deterministic=True,
+        )
+        test_dl = DataLoader(test_ds, batch_size=1, num_workers=8)
 
-    trainer.fit(model=model, train_dataloaders=train_dl, val_dataloaders=valid_dl)
-    trainer.test(model=model, dataloaders=test_dl)
+        example_bags, _ = next(iter(train_dl))
+        d_features = example_bags.size(-1)
+
+        model = BarspoonTransformer(
+            d_features=d_features,
+            n_targets=len(target_labels),
+            pos_weight=pos_weight,
+            # other hparams
+            target_labels=list(target_labels),
+            train_patients=list(cohort_df.loc[train_idx].PATIENT),
+            valid_patients=list(cohort_df.loc[valid_idx].PATIENT),
+            test_patients=list(cohort_df.loc[test_idx].PATIENT),
+            n_encoder_heads=n_encoder_heads,
+            n_decoder_heads=n_decoder_heads,
+            n_layers=n_layers,
+            d_model=d_model,
+            dim_feedforward=dim_feedforward,
+        )
+
+        try:
+            trainer = pl.Trainer(
+                default_root_dir=root_dir,
+                callbacks=[
+                    EarlyStopping(
+                        monitor="val_TopKMultilabelAUROC", mode="max", patience=16
+                    ),
+                    ModelCheckpoint(
+                        monitor="val_TopKMultilabelAUROC",
+                        mode="max",
+                        filename="checkpoint-{epoch:02d}-{val_TopKMultilabelAUROC:0.3f}",
+                    ),
+                ],
+                accelerator="auto",
+                accumulate_grad_batches=32 // batch_size,
+                gradient_clip_val=0.5,
+            )
+
+            trainer.fit(
+                model=model, train_dataloaders=train_dl, val_dataloaders=valid_dl
+            )
+            trainer.test(model=model, dataloaders=test_dl)
+
+            with open(root_dir / "done", "w"):
+                pass
+        except Exception:
+            continue
 # %%
 
 # from sklearn.metrics import roc_auc_score
