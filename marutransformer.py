@@ -7,6 +7,7 @@ from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, Optional, Tuple
+import sys
 
 import h5py
 import numpy as np
@@ -390,7 +391,7 @@ class BarspoonTransformer(pl.LightningModule):
                 self.target_labels,
                 logits.permute(-1, -2),
                 targets.permute(-1, -2),
-                strict=True,
+                # strict=True,  # python3.9 hates it
             ):
                 target_auroc = getattr(self, f"{step_name}_target_aurocs")[
                     sanatize(target_label)
@@ -436,7 +437,7 @@ def read_table(path: Path, dtype=str) -> pd.DataFrame:
         return pd.read_excel(path, dtype=dtype)
 
 
-batch_size = 2
+batch_size = 1
 clini_df = read_table(
     "/mnt/bulk/mvantreeck/gecco/gecco-multilabel/CLINI_Gecco_All_v6_MG.xlsx",
     dtype={"PATIENT": str},
@@ -512,12 +513,8 @@ def get_splits(X, n_splits: int = 6):
             test_fold_idxs.astype(int),
         )
 
-
 # %%
-# np.load("folds.npy")[0]
-# %%
-
-# %%
+root_dir = Path(f"/mnt/bulk/mvantreeck/gecco/interleaved/")
 hparam_grid = [
     {
         "n_encoder_heads": n_encoder_heads,
@@ -531,102 +528,99 @@ hparam_grid = [
     for n_layers in [1, 2, 4, 6]
     for dim_feedforward in [1024, 2048]
     for d_model in [256, 512]
+    if not all([(root_dir/f"{n_layers=}-{n_encoder_heads=}-{n_decoder_heads=}-{d_model=}-{dim_feedforward=}/{fold_no=}/done").exists()
+        for fold_no in range(6)])
 ]
-import random
-
-random.shuffle(hparam_grid)
 # %%
-fold_no = 0
-for hparams in hparam_grid:
-    n_encoder_heads = hparams["n_encoder_heads"]
-    n_decoder_heads = hparams["n_decoder_heads"]
-    n_layers = hparams["n_layers"]
-    d_model = hparams["d_model"]
-    dim_feedforward = hparams["dim_feedforward"]
-    for fold_no, (train_idx, valid_idx, test_idx) in enumerate(get_splits(X=targets)):
-        print(f"{hparams=}, {fold_no=}")
-        root_dir = Path(
-            f"/mnt/bulk/mvantreeck/gecco/interleaved/{n_layers=}-{n_encoder_heads=}-{n_decoder_heads=}-{d_model=}-{dim_feedforward=}/{fold_no=}"
-        )
-        if (root_dir / "done").exists():
-            # already done... skip
-            continue
-        elif root_dir.exists():
-            # failed; start over
-            shutil.rmtree(root_dir)
+array_id = int(sys.argv[1])
+print(f"job {array_id:3}/{len(hparam_grid)}")
+# %%
+hparams = hparam_grid[array_id]
+n_encoder_heads = hparams["n_encoder_heads"]
+n_decoder_heads = hparams["n_decoder_heads"]
+n_layers = hparams["n_layers"]
+d_model = hparams["d_model"]
+dim_feedforward = hparams["dim_feedforward"]
 
-        train_ds = BagDataset(
-            bags[train_idx],
-            targets[train_idx],
-            instances_per_bag=2**10,
-            deterministic=False,
-        )
-        train_dl = DataLoader(
-            train_ds, batch_size=batch_size, num_workers=8, shuffle=True
-        )
+for fold_no, (train_idx, valid_idx, test_idx) in enumerate(get_splits(X=targets)):
+    print(f"{hparams=}, {fold_no=}")
+    run_dir = root_dir/f"{n_layers=}-{n_encoder_heads=}-{n_decoder_heads=}-{d_model=}-{dim_feedforward=}/{fold_no=}"
+    if (run_dir / "done").exists():
+        # already done... skip
+        continue
+    elif run_dir.exists():
+        # failed; start over
+        shutil.rmtree(run_dir)
 
-        valid_ds = BagDataset(
-            bags[valid_idx],
-            targets[valid_idx],
-            instances_per_bag=2**10,
-            deterministic=True,
-        )
-        valid_dl = DataLoader(valid_ds, batch_size=batch_size, num_workers=8)
+    train_ds = BagDataset(
+        bags[train_idx],
+        targets[train_idx],
+        instances_per_bag=2**10,
+        deterministic=False,
+    )
+    train_dl = DataLoader(
+        train_ds, batch_size=batch_size, num_workers=8, shuffle=True
+    )
 
-        test_ds = BagDataset(
-            bags[test_idx],
-            targets[test_idx],
-            instances_per_bag=2**12,
-            deterministic=True,
-        )
-        test_dl = DataLoader(test_ds, batch_size=1, num_workers=8)
+    valid_ds = BagDataset(
+        bags[valid_idx],
+        targets[valid_idx],
+        instances_per_bag=2**10,
+        deterministic=True,
+    )
+    valid_dl = DataLoader(valid_ds, batch_size=batch_size, num_workers=8)
 
-        example_bags, _ = next(iter(train_dl))
-        d_features = example_bags.size(-1)
+    test_ds = BagDataset(
+        bags[test_idx],
+        targets[test_idx],
+        instances_per_bag=2**12,
+        deterministic=True,
+    )
+    test_dl = DataLoader(test_ds, batch_size=1, num_workers=8)
 
-        model = BarspoonTransformer(
-            d_features=d_features,
-            n_targets=len(target_labels),
-            pos_weight=pos_weight,
-            # other hparams
-            target_labels=list(target_labels),
-            train_patients=list(cohort_df.loc[train_idx].PATIENT),
-            valid_patients=list(cohort_df.loc[valid_idx].PATIENT),
-            test_patients=list(cohort_df.loc[test_idx].PATIENT),
-            n_encoder_heads=n_encoder_heads,
-            n_decoder_heads=n_decoder_heads,
-            n_layers=n_layers,
-            d_model=d_model,
-            dim_feedforward=dim_feedforward,
-        )
+    example_bags, _ = next(iter(train_dl))
+    d_features = example_bags.size(-1)
 
-        try:
-            trainer = pl.Trainer(
-                default_root_dir=root_dir,
-                callbacks=[
-                    EarlyStopping(
-                        monitor="val_TopKMultilabelAUROC", mode="max", patience=16
-                    ),
-                    ModelCheckpoint(
-                        monitor="val_TopKMultilabelAUROC",
-                        mode="max",
-                        filename="checkpoint-{epoch:02d}-{val_TopKMultilabelAUROC:0.3f}",
-                    ),
-                ],
-                accelerator="auto",
-                accumulate_grad_batches=32 // batch_size,
-                gradient_clip_val=0.5,
-            )
+    model = BarspoonTransformer(
+        d_features=d_features,
+        n_targets=len(target_labels),
+        pos_weight=pos_weight,
+        # other hparams
+        target_labels=list(target_labels),
+        train_patients=list(cohort_df.loc[train_idx].PATIENT),
+        valid_patients=list(cohort_df.loc[valid_idx].PATIENT),
+        test_patients=list(cohort_df.loc[test_idx].PATIENT),
+        n_encoder_heads=n_encoder_heads,
+        n_decoder_heads=n_decoder_heads,
+        n_layers=n_layers,
+        d_model=d_model,
+        dim_feedforward=dim_feedforward,
+    )
 
-            trainer.fit(
-                model=model, train_dataloaders=train_dl, val_dataloaders=valid_dl
-            )
-            trainer.test(model=model, dataloaders=test_dl)
+    trainer = pl.Trainer(
+        default_root_dir=run_dir,
+        callbacks=[
+            EarlyStopping(
+                monitor="val_TopKMultilabelAUROC", mode="max", patience=16
+            ),
+            ModelCheckpoint(
+                monitor="val_TopKMultilabelAUROC",
+                mode="max",
+                filename="checkpoint-{epoch:02d}-{val_TopKMultilabelAUROC:0.3f}",
+            ),
+        ],
+        accelerator="auto",
+        accumulate_grad_batches=32 // batch_size,
+        gradient_clip_val=0.5,
+    )
 
-            with open(root_dir / "done", "w"):
-                pass
-        except Exception:
-            continue
+    trainer.fit(
+        model=model, train_dataloaders=train_dl, val_dataloaders=valid_dl
+    )
+    trainer.test(model=model, dataloaders=test_dl)
+
+    with open(run_dir / "done-new", "w"):
+        pass
 # %%
 
 # from sklearn.metrics import roc_auc_score
