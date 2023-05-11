@@ -3,11 +3,11 @@
 import math
 import re
 import shutil
+import sys
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, Optional, Tuple
-import sys
 
 import h5py
 import numpy as np
@@ -17,7 +17,7 @@ import torch
 import torch.nn.functional as F
 import torchmetrics
 from pytorch_lightning.callbacks import EarlyStopping, ModelCheckpoint
-from sklearn.model_selection import KFold
+from pytorch_lightning.loggers import CSVLogger
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
 from torchmetrics.functional.classification.auroc import _multilabel_auroc_compute
@@ -138,23 +138,17 @@ class TopKMultilabelAUROC(torchmetrics.classification.MultilabelPrecisionRecallC
         )
 
 
-class ViTransformer(pl.LightningModule):
+class ViTransformer(nn.Module):
     def __init__(
         self,
         d_features: int,
         n_targets: int,
-        pos_weight: Optional[torch.Tensor],
         *,
-        learning_rate: float = 1e-4,
         d_model: int = 512,
         nhead: int = 8,
-        num_encoder_layers: int = 2,
-        **hparams: Any,
+        num_layers: int = 2,
     ) -> None:
         super().__init__()
-        _ = hparams
-
-        self.learning_rate = learning_rate
 
         # one class token per output class
         self.class_tokens = nn.Parameter(torch.rand(n_targets, d_model))
@@ -162,31 +156,21 @@ class ViTransformer(pl.LightningModule):
         self.projector = nn.Sequential(nn.Linear(d_features, d_model), nn.ReLU())
 
         encoder_layer = nn.TransformerEncoderLayer(
-            d_model, nhead, batch_first=True, norm_first=True
+            d_model=d_model,
+            nhead=nhead,
+            dim_feedforward=dim_feedforward,
+            batch_first=True,
+            norm_first=True,
         )
         encoder_norm = nn.LayerNorm(d_model)
         self.encoder_stack = nn.TransformerEncoder(
-            encoder_layer,
-            num_encoder_layers,
+            encoder_layer=encoder_layer,
+            num_layers=num_layers,
             norm=encoder_norm,
         )
         self.heads = ParallelLinear(
             in_features=d_model, out_features=1, n_parallel=n_targets
         )
-
-        metrics = torchmetrics.MetricCollection(
-            [
-                TopKMultilabelAUROC(
-                    num_labels=n_targets, topk=max(int(n_targets * 0.2), 1)
-                )
-            ]
-        )
-        for step in ["train", "val", "test"]:
-            setattr(self, f"{step}_global_metrics", metrics.clone(prefix=f"{step}_"))
-
-        self.pos_weight = pos_weight
-
-        self.save_hyperparameters()
 
     def forward(self, bag):
         batch_size, _, _ = bag.shape
@@ -208,79 +192,29 @@ class ViTransformer(pl.LightningModule):
 
         return logits
 
-    def step(self, batch, step_name=None):
-        bag, target = batch
-        logits = self(bag)
-        loss = F.binary_cross_entropy_with_logits(
-            logits,
-            target,
-            pos_weight=self.pos_weight.type_as(target),
-            reduction="none",
-        ).nansum()
-        if step_name:
-            metrics = getattr(self, f"{step_name}_metrics")
-            metrics.update(logits, target.long())
-            self.log_dict(
-                metrics, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True
-            )
 
-            self.log(
-                f"{step_name}_loss", loss, on_step=True, on_epoch=True, sync_dist=True
-            )
-
-        return loss
-
-    def training_step(self, batch, batch_idx):
-        return self.step(batch, step_name="train")
-
-    def validation_step(self, batch, batch_idx):
-        return self.step(batch, step_name="val")
-
-    def test_step(self, batch, batch_idx):
-        return self.step(batch, step_name="test")
-
-    def predict_step(self, batch, batch_idx, dataloader_idx=0):
-        bag, targets = batch
-        logits = self(bag)
-        return torch.sigmoid(logits), targets
-
-    def configure_optimizers(self):
-        optimizer = torch.optim.Adam(self.parameters(), lr=self.learning_rate)
-        return optimizer
-
-
-class BarspoonTransformer(pl.LightningModule):
-    """
-        ┏━━┓     ┏━━┓          ┏━━┓
-    t ─▶┃E0┠──┬─▶┃E1┠──┬──···─▶┃En┠──┐
-        ┗━━┛  │  ┗━━┛  │       ┗━━┛  │
-              ▼        ▼             ▼
-            ┏━━┓     ┏━━┓          ┏━━┓  ┏━━┓
-    c ─────▶┃D0┠────▶┃D1┠─···─────▶┃Dn┠─▶┃FC┠─▶ s
-            ┗━━┛     ┗━━┛          ┗━━┛  ┗━━┛
-    """
-
+class BarspoonTransformer(nn.Module):
     def __init__(
         self,
         d_features: int,
         n_targets: int,
         *,
-        target_labels: Sequence[str],
-        pos_weight: Optional[torch.Tensor],
-        # model parameters
         d_model: int = 512,
-        n_encoder_heads: int = 8,
-        n_decoder_heads: int = 8,
-        n_layers: int = 2,
+        num_encoder_heads: int = 8,
+        num_decoder_heads: int = 8,
+        num_layers: int = 2,
         dim_feedforward: int = 2048,
-        # other hparams
-        learning_rate: float = 1e-4,
-        **hparams: Any,
     ) -> None:
+        """
+            ┏━━┓     ┏━━┓          ┏━━┓
+        t ─▶┃E0┠──┬─▶┃E1┠──┬──···─▶┃En┠──┐
+            ┗━━┛  │  ┗━━┛  │       ┗━━┛  │
+                ▼        ▼             ▼
+                ┏━━┓     ┏━━┓          ┏━━┓  ┏━━┓
+        c ─────▶┃D0┠────▶┃D1┠─···─────▶┃Dn┠─▶┃FC┠─▶ s
+                ┗━━┛     ┗━━┛          ┗━━┛  ┗━━┛
+        """
         super().__init__()
-        _ = hparams  # so we don't get unused parameter warnings
-
-        self.learning_rate = learning_rate
 
         # one class token per output class
         self.class_tokens = nn.Parameter(torch.rand(n_targets, d_model))
@@ -292,28 +226,60 @@ class BarspoonTransformer(pl.LightningModule):
                 nn.ModuleDict(
                     {
                         "encoder": nn.TransformerEncoderLayer(
-                            d_model,
-                            n_encoder_heads,
+                            d_model=d_model,
+                            nhead=num_encoder_heads,
                             dim_feedforward=dim_feedforward,
                             batch_first=True,
                             norm_first=True,
                         ),
                         "decoder": nn.TransformerDecoderLayer(
                             d_model,
-                            n_decoder_heads,
+                            num_decoder_heads,
                             dim_feedforward=dim_feedforward,
                             batch_first=True,
                             norm_first=True,
                         ),
                     }
                 )
-                for _ in range(n_layers)
+                for _ in range(num_layers)
             ]
         )
         # TODO maybe we need a norm???
         self.heads = ParallelLinear(
             in_features=d_model, out_features=1, n_parallel=n_targets
         )
+
+    def forward(self, tile_tokens):
+        batch_size, _, _ = tile_tokens.shape
+
+        tile_tokens = self.projector(tile_tokens)  # shape: [bs, seq_len, d_model]
+        class_tokens = self.class_tokens.expand(batch_size, -1, -1)
+
+        for layer in self.encoder_decoder_pairs:
+            tile_tokens = layer["encoder"](tile_tokens)
+            class_tokens = layer["decoder"](tgt=class_tokens, memory=tile_tokens)
+
+        # apply the corresponding head to each class token
+        logits = self.heads(class_tokens).squeeze(-1)
+
+        return logits
+
+
+class LitMilClassificationMixin(pl.LightningModule):
+    def __init__(
+        self,
+        *,
+        target_labels: Sequence[str],
+        pos_weight: Optional[torch.Tensor],
+        # other hparams
+        learning_rate: float = 1e-4,
+        **hparams: Any,
+    ) -> None:
+        super().__init__()
+        _ = hparams  # so we don't get unused parameter warnings
+
+        self.learning_rate = learning_rate
+        n_targets = len(target_labels)
 
         # use the same metrics for training, validation and testing
         global_metrics = torchmetrics.MetricCollection(
@@ -346,21 +312,6 @@ class BarspoonTransformer(pl.LightningModule):
 
         self.save_hyperparameters()
 
-    def forward(self, tile_tokens):
-        batch_size, _, _ = tile_tokens.shape
-
-        tile_tokens = self.projector(tile_tokens)  # shape: [bs, seq_len, d_model]
-        class_tokens = self.class_tokens.expand(batch_size, -1, -1)
-
-        for layer in self.encoder_decoder_pairs:
-            tile_tokens = layer["encoder"](tile_tokens)
-            class_tokens = layer["decoder"](tgt=class_tokens, memory=tile_tokens)
-
-        # apply the corresponding head to each class token
-        logits = self.heads(class_tokens).squeeze(-1)
-
-        return logits
-
     def step(self, batch, step_name=None):
         bags, targets = batch
         logits = self(bags)
@@ -370,7 +321,7 @@ class BarspoonTransformer(pl.LightningModule):
             targets,
             pos_weight=self.pos_weight.type_as(targets),
             reduction="none",
-        ).nansum()
+        ).nansum() / len(self.target_labels)
         if step_name:
             # update global metrics
             global_metrics = getattr(self, f"{step_name}_global_metrics")
@@ -424,6 +375,46 @@ class BarspoonTransformer(pl.LightningModule):
     def configure_optimizers(self):
         optimizer = torch.optim.Adam(self.parameters(), lr=self.learning_rate)
         return optimizer
+
+
+class LitBarspoonTransformer(LitMilClassificationMixin):
+    def __init__(
+        self,
+        *,
+        d_features: int,
+        target_labels: Sequence[str],
+        pos_weight: Optional[torch.Tensor],
+        # model parameters
+        d_model: int = 512,
+        num_encoder_heads: int = 8,
+        num_decoder_heads: int = 8,
+        num_layers: int = 2,
+        dim_feedforward: int = 2048,
+        # other hparams
+        learning_rate: float = 1e-4,
+        **hparams: Any,
+    ) -> None:
+        super().__init__(
+            target_labels=target_labels,
+            pos_weight=pos_weight,
+            learning_rate=learning_rate,
+        )
+        _ = hparams  # so we don't get unused parameter warnings
+
+        self.model = BarspoonTransformer(
+            d_features=d_features,
+            n_targets=len(target_labels),
+            d_model=d_model,
+            num_encoder_heads=num_encoder_heads,
+            num_decoder_heads=num_decoder_heads,
+            num_layers=num_layers,
+            dim_feedforward=dim_feedforward,
+        )
+
+        self.save_hyperparameters()
+
+    def forward(self, tile_tokens):
+        return self.model(tile_tokens)
 
 
 def sanatize(x: str) -> str:
@@ -513,38 +504,49 @@ def get_splits(X, n_splits: int = 6):
             test_fold_idxs.astype(int),
         )
 
+
 # %%
 root_dir = Path(f"/mnt/bulk/mvantreeck/gecco/interleaved/")
 hparam_grid = [
     {
-        "n_encoder_heads": n_encoder_heads,
-        "n_decoder_heads": n_decoder_heads,
-        "n_layers": n_layers,
+        "num_encoder_heads": num_encoder_heads,
+        "num_decoder_heads": num_decoder_heads,
+        "num_layers": num_layers,
         "dim_feedforward": dim_feedforward,
         "d_model": d_model,
     }
-    for n_encoder_heads in [8, 16]
-    for n_decoder_heads in [8, 16]
-    for n_layers in [1, 2, 4, 6]
+    for num_encoder_heads in [8, 16]
+    for num_decoder_heads in [8, 16]
+    for num_layers in [1, 2, 4, 6]
     for dim_feedforward in [1024, 2048]
     for d_model in [256, 512]
-    if not all([(root_dir/f"{n_layers=}-{n_encoder_heads=}-{n_decoder_heads=}-{d_model=}-{dim_feedforward=}/{fold_no=}/done").exists()
-        for fold_no in range(6)])
+    if not all(
+        [
+            (
+                root_dir
+                / f"{num_layers=}-{num_encoder_heads=}-{num_decoder_heads=}-{d_model=}-{dim_feedforward=}/{fold_no=}/done"
+            ).exists()
+            for fold_no in range(6)
+        ]
+    )
 ]
 # %%
 array_id = int(sys.argv[1])
 print(f"job {array_id:3}/{len(hparam_grid)}")
 # %%
 hparams = hparam_grid[array_id]
-n_encoder_heads = hparams["n_encoder_heads"]
-n_decoder_heads = hparams["n_decoder_heads"]
-n_layers = hparams["n_layers"]
+num_encoder_heads = hparams["num_encoder_heads"]
+num_decoder_heads = hparams["num_decoder_heads"]
+num_layers = hparams["num_layers"]
 d_model = hparams["d_model"]
 dim_feedforward = hparams["dim_feedforward"]
 
 for fold_no, (train_idx, valid_idx, test_idx) in enumerate(get_splits(X=targets)):
-    print(f"{hparams=}, {fold_no=}")
-    run_dir = root_dir/f"{n_layers=}-{n_encoder_heads=}-{n_decoder_heads=}-{d_model=}-{dim_feedforward=}/{fold_no=}"
+    run_dir = (
+        root_dir
+        / f"{num_layers=}-{num_encoder_heads=}-{num_decoder_heads=}-{d_model=}-{dim_feedforward=}/{fold_no=}"
+    )
+    print(f"{run_dir=}")
     if (run_dir / "done").exists():
         # already done... skip
         continue
@@ -558,9 +560,7 @@ for fold_no, (train_idx, valid_idx, test_idx) in enumerate(get_splits(X=targets)
         instances_per_bag=2**10,
         deterministic=False,
     )
-    train_dl = DataLoader(
-        train_ds, batch_size=batch_size, num_workers=8, shuffle=True
-    )
+    train_dl = DataLoader(train_ds, batch_size=batch_size, num_workers=8, shuffle=True)
 
     valid_ds = BagDataset(
         bags[valid_idx],
@@ -581,7 +581,7 @@ for fold_no, (train_idx, valid_idx, test_idx) in enumerate(get_splits(X=targets)
     example_bags, _ = next(iter(train_dl))
     d_features = example_bags.size(-1)
 
-    model = BarspoonTransformer(
+    model = LitBarspoonTransformer(
         d_features=d_features,
         n_targets=len(target_labels),
         pos_weight=pos_weight,
@@ -590,9 +590,9 @@ for fold_no, (train_idx, valid_idx, test_idx) in enumerate(get_splits(X=targets)
         train_patients=list(cohort_df.loc[train_idx].PATIENT),
         valid_patients=list(cohort_df.loc[valid_idx].PATIENT),
         test_patients=list(cohort_df.loc[test_idx].PATIENT),
-        n_encoder_heads=n_encoder_heads,
-        n_decoder_heads=n_decoder_heads,
-        n_layers=n_layers,
+        num_encoder_heads=num_encoder_heads,
+        num_decoder_heads=num_decoder_heads,
+        num_layers=num_layers,
         d_model=d_model,
         dim_feedforward=dim_feedforward,
     )
@@ -600,9 +600,7 @@ for fold_no, (train_idx, valid_idx, test_idx) in enumerate(get_splits(X=targets)
     trainer = pl.Trainer(
         default_root_dir=run_dir,
         callbacks=[
-            EarlyStopping(
-                monitor="val_TopKMultilabelAUROC", mode="max", patience=16
-            ),
+            EarlyStopping(monitor="val_TopKMultilabelAUROC", mode="max", patience=16),
             ModelCheckpoint(
                 monitor="val_TopKMultilabelAUROC",
                 mode="max",
@@ -612,14 +610,13 @@ for fold_no, (train_idx, valid_idx, test_idx) in enumerate(get_splits(X=targets)
         accelerator="auto",
         accumulate_grad_batches=32 // batch_size,
         gradient_clip_val=0.5,
+        logger=CSVLogger(save_dir=run_dir),
     )
 
-    trainer.fit(
-        model=model, train_dataloaders=train_dl, val_dataloaders=valid_dl
-    )
+    trainer.fit(model=model, train_dataloaders=train_dl, val_dataloaders=valid_dl)
     trainer.test(model=model, dataloaders=test_dl)
 
-    with open(run_dir / "done-new", "w"):
+    with open(run_dir / "done", "w"):
         pass
 # %%
 
