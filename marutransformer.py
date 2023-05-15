@@ -1,13 +1,29 @@
 #!/usr/bin/env python3
 # %%
+import argparse
 import math
 import re
 import shutil
-import sys
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, Optional, Tuple
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--clini-table", type=Path, required=True)
+    parser.add_argument("--slide-table", type=Path, required=True)
+    parser.add_argument("--feature-dir", type=Path, required=True)
+    parser.add_argument("--target-file", type=Path, required=True)
+    parser.add_argument("--num-encoder-heads", type=int, default=8)
+    parser.add_argument("--num-decoder-heads", type=int, default=8)
+    parser.add_argument("--num-layers", type=int, default=2)
+    parser.add_argument("--d-model", type=int, default=512)
+    parser.add_argument("--dim-feedforward", type=int, default=2048)
+    parser.add_argument("--instances-per-bag", type=int, default=2**10)
+    parser.add_argument("--learning-rate", type=float, default=1e-4)
+    args = parser.parse_args()
 
 import h5py
 import numpy as np
@@ -209,7 +225,7 @@ class BarspoonTransformer(nn.Module):
             ┏━━┓     ┏━━┓          ┏━━┓
         t ─▶┃E0┠──┬─▶┃E1┠──┬──···─▶┃En┠──┐
             ┗━━┛  │  ┗━━┛  │       ┗━━┛  │
-                ▼        ▼             ▼
+                  ▼        ▼             ▼
                 ┏━━┓     ┏━━┓          ┏━━┓  ┏━━┓
         c ─────▶┃D0┠────▶┃D1┠─···─────▶┃Dn┠─▶┃FC┠─▶ s
                 ┗━━┛     ┗━━┛          ┗━━┛  ┗━━┛
@@ -385,13 +401,13 @@ class LitBarspoonTransformer(LitMilClassificationMixin):
         target_labels: Sequence[str],
         pos_weight: Optional[torch.Tensor],
         # model parameters
-        d_model: int = 512,
-        num_encoder_heads: int = 8,
-        num_decoder_heads: int = 8,
-        num_layers: int = 2,
-        dim_feedforward: int = 2048,
+        d_model: int,  # = 512,
+        num_encoder_heads: int,  # = 8,
+        num_decoder_heads: int,  # = 8,
+        num_layers: int,  # = 2,
+        dim_feedforward: int,  # = 2048,
         # other hparams
-        learning_rate: float = 1e-4,
+        learning_rate: float,  # = 1e-4,
         **hparams: Any,
     ) -> None:
         super().__init__(
@@ -426,48 +442,6 @@ def read_table(path: Path, dtype=str) -> pd.DataFrame:
         return pd.read_csv(path, dtype=dtype)
     else:
         return pd.read_excel(path, dtype=dtype)
-
-
-batch_size = 1
-clini_df = read_table(
-    "/mnt/bulk/mvantreeck/gecco/gecco-multilabel/CLINI_Gecco_All_v6_MG.xlsx",
-    dtype={"PATIENT": str},
-)
-slide_df = read_table(
-    "/mnt/bulk/mvantreeck/gecco/gecco-multilabel/SLIDE_GECCO_IWHS.csv"
-)[["PATIENT", "FILENAME"]]
-df = clini_df.merge(slide_df, on="PATIENT")
-assert not df.empty, "no overlap between clini and slide table."
-
-feature_dir = Path("/mnt/bulk/mvantreeck/gecco/gecco-multilabel/IWHS")
-# remove slides we don't have
-h5s = set(feature_dir.glob("*.h5"))
-assert h5s, f"no features found in {feature_dir}!"
-h5_df = pd.DataFrame(h5s, columns=["slide_path"])
-h5_df["FILENAME"] = h5_df.slide_path.map(lambda p: p.stem)
-cohort_df = df.merge(h5_df, on="FILENAME").reset_index()
-# reduce to one row per patient with list of slides in `df['slide_path']`
-patient_df = cohort_df.groupby("PATIENT").first().drop(columns="slide_path")
-patient_slides = cohort_df.groupby("PATIENT").slide_path.apply(list)
-cohort_df = patient_df.merge(
-    patient_slides, left_on="PATIENT", right_index=True
-).reset_index()
-
-with open("/mnt/bulk/mvantreeck/gecco/gecco-multilabel/targets_1.txt") as targets_file:
-    target_labels = np.array([target_label.strip() for target_label in targets_file])
-
-target_labels = target_labels[cohort_df[target_labels].nunique(dropna=True) == 2]
-target_labels = (
-    cohort_df[target_labels]
-    .select_dtypes(["int16", "int32", "int64", "float16", "float32", "float64"])
-    .columns.values
-)
-
-targets = torch.Tensor(cohort_df[target_labels].apply(pd.to_numeric).values)
-bags = cohort_df.slide_path.values
-pos_samples = targets.nansum(dim=0)
-neg_samples = (1 - targets).nansum(dim=0)
-pos_weight = neg_samples / pos_samples
 
 
 def get_splits(X, n_splits: int = 6):
@@ -505,185 +479,134 @@ def get_splits(X, n_splits: int = 6):
         )
 
 
-# %%
-root_dir = Path(f"/mnt/bulk/mvantreeck/gecco/interleaved/")
-hparam_grid = [
-    {
-        "num_encoder_heads": num_encoder_heads,
-        "num_decoder_heads": num_decoder_heads,
-        "num_layers": num_layers,
-        "dim_feedforward": dim_feedforward,
-        "d_model": d_model,
-    }
-    for num_encoder_heads in [8, 16]
-    for num_decoder_heads in [8, 16]
-    for num_layers in [1, 2, 4, 6]
-    for dim_feedforward in [1024, 2048]
-    for d_model in [256, 512]
-    if not all(
-        [
-            (
-                root_dir
-                / f"{num_layers=}-{num_encoder_heads=}-{num_decoder_heads=}-{d_model=}-{dim_feedforward=}/{fold_no=}/done"
-            ).exists()
-            for fold_no in range(6)
-        ]
+import random
+
+if __name__ == "__main__":
+    args.num_encoder_heads = random.randint(4, 8)
+    args.num_decoder_heads = random.randint(4, 8)
+    args.num_layers = random.randint(1, 6)
+    args.d_model = round(2 ** random.uniform(5, 11)) // 8 * 8
+    args.dim_feedforward = round(2 ** random.uniform(8, 12))
+    args.instances_per_bag = round(2 ** random.uniform(9, 12))
+    args.learning_rate = 10 ** (random.uniform(-3, -5))
+    batch_size = 4
+
+    clini_df = read_table(
+        args.clini_table,
+        dtype={"PATIENT": str},
     )
-]
-# %%
-array_id = int(sys.argv[1])
-print(f"job {array_id:3}/{len(hparam_grid)}")
-# %%
-hparams = hparam_grid[array_id]
-num_encoder_heads = hparams["num_encoder_heads"]
-num_decoder_heads = hparams["num_decoder_heads"]
-num_layers = hparams["num_layers"]
-d_model = hparams["d_model"]
-dim_feedforward = hparams["dim_feedforward"]
+    slide_df = read_table(
+        args.slide_table,
+    )[["PATIENT", "FILENAME"]]
+    df = clini_df.merge(slide_df, on="PATIENT")
+    assert not df.empty, "no overlap between clini and slide table."
 
-for fold_no, (train_idx, valid_idx, test_idx) in enumerate(get_splits(X=targets)):
-    run_dir = (
-        root_dir
-        / f"{num_layers=}-{num_encoder_heads=}-{num_decoder_heads=}-{d_model=}-{dim_feedforward=}/{fold_no=}"
-    )
-    print(f"{run_dir=}")
-    if (run_dir / "done").exists():
-        # already done... skip
-        continue
-    elif run_dir.exists():
-        # failed; start over
-        shutil.rmtree(run_dir)
+    # remove slides we don't have
+    h5s = set(args.feature_dir.glob("*.h5"))
+    assert h5s, f"no features found in {args.feature_dir}!"
+    h5_df = pd.DataFrame(h5s, columns=["slide_path"])
+    h5_df["FILENAME"] = h5_df.slide_path.map(lambda p: p.stem)
+    cohort_df = df.merge(h5_df, on="FILENAME").reset_index()
+    # reduce to one row per patient with list of slides in `df['slide_path']`
+    patient_df = cohort_df.groupby("PATIENT").first().drop(columns="slide_path")
+    patient_slides = cohort_df.groupby("PATIENT").slide_path.apply(list)
+    cohort_df = patient_df.merge(
+        patient_slides, left_on="PATIENT", right_index=True
+    ).reset_index()
 
-    train_ds = BagDataset(
-        bags[train_idx],
-        targets[train_idx],
-        instances_per_bag=2**10,
-        deterministic=False,
-    )
-    train_dl = DataLoader(train_ds, batch_size=batch_size, num_workers=8, shuffle=True)
+    with open(args.target_file) as targets_file:
+        target_labels = np.array(
+            [target_label.strip() for target_label in targets_file]
+        )
 
-    valid_ds = BagDataset(
-        bags[valid_idx],
-        targets[valid_idx],
-        instances_per_bag=2**10,
-        deterministic=True,
-    )
-    valid_dl = DataLoader(valid_ds, batch_size=batch_size, num_workers=8)
-
-    test_ds = BagDataset(
-        bags[test_idx],
-        targets[test_idx],
-        instances_per_bag=2**12,
-        deterministic=True,
-    )
-    test_dl = DataLoader(test_ds, batch_size=1, num_workers=8)
-
-    example_bags, _ = next(iter(train_dl))
-    d_features = example_bags.size(-1)
-
-    model = LitBarspoonTransformer(
-        d_features=d_features,
-        n_targets=len(target_labels),
-        pos_weight=pos_weight,
-        # other hparams
-        target_labels=list(target_labels),
-        train_patients=list(cohort_df.loc[train_idx].PATIENT),
-        valid_patients=list(cohort_df.loc[valid_idx].PATIENT),
-        test_patients=list(cohort_df.loc[test_idx].PATIENT),
-        num_encoder_heads=num_encoder_heads,
-        num_decoder_heads=num_decoder_heads,
-        num_layers=num_layers,
-        d_model=d_model,
-        dim_feedforward=dim_feedforward,
+    target_labels = target_labels[cohort_df[target_labels].nunique(dropna=True) == 2]
+    target_labels = (
+        cohort_df[target_labels]
+        .select_dtypes(["int16", "int32", "int64", "float16", "float32", "float64"])
+        .columns.values
     )
 
-    trainer = pl.Trainer(
-        default_root_dir=run_dir,
-        callbacks=[
-            EarlyStopping(monitor="val_TopKMultilabelAUROC", mode="max", patience=16),
-            ModelCheckpoint(
-                monitor="val_TopKMultilabelAUROC",
-                mode="max",
-                filename="checkpoint-{epoch:02d}-{val_TopKMultilabelAUROC:0.3f}",
-            ),
-        ],
-        accelerator="auto",
-        accumulate_grad_batches=32 // batch_size,
-        gradient_clip_val=0.5,
-        logger=CSVLogger(save_dir=run_dir),
+    targets = torch.Tensor(cohort_df[target_labels].apply(pd.to_numeric).values)
+    bags = cohort_df.slide_path.values
+    pos_samples = targets.nansum(dim=0)
+    neg_samples = (1 - targets).nansum(dim=0)
+    pos_weight = neg_samples / pos_samples
+
+    configuration_str = "-".join(
+        f"{k}={v}" for k, v in sorted(vars(args).items()) if isinstance(v, (int, float))
     )
 
-    trainer.fit(model=model, train_dataloaders=train_dl, val_dataloaders=valid_dl)
-    trainer.test(model=model, dataloaders=test_dl)
+    for fold_no, (train_idx, valid_idx, test_idx) in enumerate(get_splits(X=targets)):
+        run_dir = args.output_dir / configuration_str / f"{fold_no=}"
+        print(f"{run_dir=}")
+        if (run_dir / "done").exists():
+            # already done... skip
+            continue
+        elif run_dir.exists():
+            # failed; start over
+            shutil.rmtree(run_dir)
 
-    with open(run_dir / "done", "w"):
-        pass
-# %%
+        train_ds = BagDataset(
+            bags[train_idx],
+            targets[train_idx],
+            instances_per_bag=args.instances_per_bag,
+            deterministic=False,
+        )
+        train_dl = DataLoader(
+            train_ds, batch_size=batch_size, num_workers=8, shuffle=True
+        )
 
-# from sklearn.metrics import roc_auc_score
+        valid_ds = BagDataset(
+            bags[valid_idx],
+            targets[valid_idx],
+            instances_per_bag=args.instances_per_bag,
+            deterministic=True,
+        )
+        valid_dl = DataLoader(valid_ds, batch_size=batch_size, num_workers=8)
 
-# def get_aurocs(bags, targets):
-#     predict_ds = BagDataset(
-#         bags, targets, instances_per_bag=2**12, deterministic=True
-#     )
-#     predict_dl = DataLoader(predict_ds, batch_size=1, num_workers=8)
-#     trainer = pl.Trainer(
-#         default_root_dir=f"ipsum",
-#         max_epochs=1,
-#         accelerator="auto",
-#         devices=1,
-#     )
-#     x = trainer.predict(model, predict_dl)
+        test_ds = BagDataset(
+            bags[test_idx],
+            targets[test_idx],
+            instances_per_bag=2**12,
+            deterministic=True,
+        )
+        test_dl = DataLoader(test_ds, batch_size=1, num_workers=8)
 
-#     scores = torch.stack([scores.squeeze(-2) for scores, _ in x])
-#     targets = torch.stack([targets.squeeze(-2) for _, targets in x])
+        example_bags, _ = next(iter(train_dl))
+        d_features = example_bags.size(-1)
 
-#     predict_aurocs = {}
-#     for target_label, t, s in zip(target_labels, targets.transpose(0,1), scores.transpose(0,1), strict=True):
-#         if (t == 1).all() or (t == 0).all():
-#             continue
-#         predict_aurocs[target_label] = roc_auc_score(t, s)
+        model = LitBarspoonTransformer(
+            d_features=d_features,
+            n_targets=len(target_labels),
+            pos_weight=pos_weight,
+            # other hparams
+            target_labels=list(target_labels),
+            train_patients=list(cohort_df.loc[train_idx].PATIENT),
+            valid_patients=list(cohort_df.loc[valid_idx].PATIENT),
+            test_patients=list(cohort_df.loc[test_idx].PATIENT),
+            **vars(args),
+        )
 
-#     return predict_aurocs
+        trainer = pl.Trainer(
+            default_root_dir=run_dir,
+            callbacks=[
+                EarlyStopping(
+                    monitor="val_TopKMultilabelAUROC", mode="max", patience=16
+                ),
+                ModelCheckpoint(
+                    monitor="val_TopKMultilabelAUROC",
+                    mode="max",
+                    filename="checkpoint-{epoch:02d}-{val_TopKMultilabelAUROC:0.3f}",
+                ),
+            ],
+            accelerator="auto",
+            accumulate_grad_batches=32 // batch_size,
+            gradient_clip_val=0.5,
+            logger=CSVLogger(save_dir=run_dir),
+        )
 
-# # %%
-# aurocs = {}
-# for fold_no in range(6):
-#     model_path = next(Path(f"lorem-{fold_no=}/lightning_logs/version_0/checkpoints").glob("checkpoint-*.ckpt"))
-#     model = BarspoonTransformer.load_from_checkpoint(model_path)
-#     for part in ["valid_patients", "test_patients"]:
-#         test_df = cohort_df[cohort_df.PATIENT.isin(model.hparams[part])]
-#         targets = torch.Tensor(test_df[model.hparams["target_labels"]].apply(pd.to_numeric).values)
-#         bags = test_df.slide_path.values
+        trainer.fit(model=model, train_dataloaders=train_dl, val_dataloaders=valid_dl)
+        trainer.test(model=model, dataloaders=test_dl)
 
-#         aurocs[(fold_no, part)] = get_aurocs(bags, targets)
-# # %%
-# import matplotlib.pyplot as plt
-# import numpy as np
-
-# fig, ax = plt.subplots(subplot_kw={"aspect": "equal"})
-# ax.plot([.3,1], [.3,1], 'r--')
-# for target_label in target_labels:
-#     test_scores = [aurocs[fold_no, "test_patients"].get(target_label) for fold_no in range(6)]
-#     marugoto_scores = []
-#     try:
-#         for fold_no in range(5):
-#             df = pd.read_csv(f"/mnt/bulk/mvantreeck/gecco/gecco-marugoto-results/{target_label}/fold-{fold_no}/patient-preds.csv")
-#             marugoto_scores.append(roc_auc_score(df[target_label], df[f"{target_label}_1"]))
-#     except Exception:
-#         continue
-#     if None in (set(marugoto_scores) | set(test_scores)):
-#         continue
-#     # if min(valid_scores) < .6:
-#     #     continue
-
-#     plt.scatter([np.mean(marugoto_scores)], [np.mean(test_scores)], marker='.')
-
-# ax.set_aspect("equal")
-# plt.title("Median AUROC for GECCO IWHS Crossval")
-# plt.xlabel("marugoto")
-# plt.ylabel("multilabel")
-# plt.hlines([.5], .3, 1, ['r'], linestyles='dotted')
-# plt.vlines([.5], .3, 1, ['r'], linestyles='dotted')
-# # %%
-# %%
+        with open(run_dir / "done", "w"):
+            pass
