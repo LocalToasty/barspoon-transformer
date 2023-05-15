@@ -479,11 +479,14 @@ def get_splits(X, n_splits: int = 6):
         )
 
 
+# %%
 import random
+random.choice([1, 2, 4, 8])
+# %%
 
 if __name__ == "__main__":
-    args.num_encoder_heads = random.randint(4, 8)
-    args.num_decoder_heads = random.randint(4, 8)
+    args.num_encoder_heads = random.choice([2, 4, 8])
+    args.num_decoder_heads = random.choice([2, 4, 8])
     args.num_layers = random.randint(1, 6)
     args.d_model = round(2 ** random.uniform(5, 11)) // 8 * 8
     args.dim_feedforward = round(2 ** random.uniform(8, 12))
