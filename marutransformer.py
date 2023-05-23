@@ -625,7 +625,7 @@ if __name__ == "__main__":
         example_bags, _ = next(iter(train_dl))
         d_features = example_bags.size(-1)
 
-        model = LitBarspoonTransformer(
+        model = LitVisionTransformer(
             d_features=d_features,
             n_targets=len(target_labels),
             pos_weight=pos_weight,
