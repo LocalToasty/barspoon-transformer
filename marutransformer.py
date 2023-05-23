@@ -16,6 +16,7 @@ if __name__ == "__main__":
     parser.add_argument("--slide-table", type=Path, required=True)
     parser.add_argument("--feature-dir", type=Path, required=True)
     parser.add_argument("--target-file", type=Path, required=True)
+    parser.add_argument("--num-heads", type=int, default=8)
     parser.add_argument("--num-encoder-heads", type=int, default=8)
     parser.add_argument("--num-decoder-heads", type=int, default=8)
     parser.add_argument("--num-layers", type=int, default=2)
@@ -154,15 +155,16 @@ class TopKMultilabelAUROC(torchmetrics.classification.MultilabelPrecisionRecallC
         )
 
 
-class ViTransformer(nn.Module):
+class VisionTransformer(nn.Module):
     def __init__(
         self,
         d_features: int,
         n_targets: int,
         *,
         d_model: int = 512,
-        nhead: int = 8,
+        num_heads: int = 8,
         num_layers: int = 2,
+        dim_feedforward: int = 2048,
     ) -> None:
         super().__init__()
 
@@ -173,7 +175,7 @@ class ViTransformer(nn.Module):
 
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=d_model,
-            nhead=nhead,
+            nhead=num_heads,
             dim_feedforward=dim_feedforward,
             batch_first=True,
             norm_first=True,
@@ -433,6 +435,44 @@ class LitBarspoonTransformer(LitMilClassificationMixin):
         return self.model(tile_tokens)
 
 
+class LitVisionTransformer(LitMilClassificationMixin):
+    def __init__(
+        self,
+        *,
+        d_features: int,
+        target_labels: Sequence[str],
+        pos_weight: Optional[torch.Tensor],
+        # model parameters
+        d_model: int,  # = 512,
+        num_heads: int,  # = 8,
+        num_layers: int,  # = 2,
+        dim_feedforward: int,  # = 2048,
+        # other hparams
+        learning_rate: float,  # = 1e-4,
+        **hparams: Any,
+    ) -> None:
+        super().__init__(
+            target_labels=target_labels,
+            pos_weight=pos_weight,
+            learning_rate=learning_rate,
+        )
+        _ = hparams  # so we don't get unused parameter warnings
+
+        self.model = VisionTransformer(
+            d_features=d_features,
+            n_targets=len(target_labels),
+            d_model=d_model,
+            num_heads=num_heads,
+            num_layers=num_layers,
+            dim_feedforward=dim_feedforward,
+        )
+
+        self.save_hyperparameters()
+
+    def forward(self, tile_tokens):
+        return self.model(tile_tokens)
+
+
 def sanatize(x: str) -> str:
     return re.sub(r"[^A-Za-z0-9_]", "_", x)
 
@@ -481,15 +521,22 @@ def get_splits(X, n_splits: int = 6):
 
 # %%
 import random
-random.choice([1, 2, 4, 8])
+
 # %%
 
 if __name__ == "__main__":
-    args.num_encoder_heads = random.choice([2, 4, 8])
-    args.num_decoder_heads = random.choice([2, 4, 8])
-    args.num_layers = random.randint(1, 6)
+    # vision
     args.d_model = round(2 ** random.uniform(5, 11)) // 8 * 8
+    args.num_heads = random.choice([2, 4, 8])
+    args.num_layers = random.randint(1, 6)
     args.dim_feedforward = round(2 ** random.uniform(8, 12))
+    # barspoon
+    # args.num_encoder_heads = random.choice([2, 4, 8])
+    # args.num_decoder_heads = random.choice([2, 4, 8])
+    # args.num_layers = random.randint(1, 6)
+    # args.d_model = round(2 ** random.uniform(5, 11)) // 8 * 8
+    # args.dim_feedforward = round(2 ** random.uniform(8, 12))
+    # other
     args.instances_per_bag = round(2 ** random.uniform(9, 12))
     args.learning_rate = 10 ** (random.uniform(-3, -5))
     batch_size = 4
