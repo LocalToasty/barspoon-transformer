@@ -15,14 +15,15 @@ if __name__ == "__main__":
     parser.add_argument("--clini-table", type=Path, required=True)
     parser.add_argument("--slide-table", type=Path, required=True)
     parser.add_argument("--feature-dir", type=Path, required=True)
-    parser.add_argument("--target-file", type=Path, required=True)
+    # parser.add_argument("--target-file", type=Path, required=True)
+    parser.add_argument("target-label", type=str, required=True)
     parser.add_argument("--num-heads", type=int, default=8)
     parser.add_argument("--num-encoder-heads", type=int, default=8)
     parser.add_argument("--num-decoder-heads", type=int, default=8)
-    parser.add_argument("--num-layers", type=int, default=2)
+    parser.add_argument("--num-layers", type=int, default=3)
     parser.add_argument("--d-model", type=int, default=512)
-    parser.add_argument("--dim-feedforward", type=int, default=2048)
-    parser.add_argument("--instances-per-bag", type=int, default=2**10)
+    parser.add_argument("--dim-feedforward", type=int, default=3e3)
+    parser.add_argument("--instances-per-bag", type=int, default=2**12)
     parser.add_argument("--learning-rate", type=float, default=1e-4)
     args = parser.parse_args()
 
@@ -526,19 +527,21 @@ import random
 
 if __name__ == "__main__":
     # vision
-    args.d_model = round(2 ** random.uniform(5, 11)) // 8 * 8
-    args.num_heads = random.choice([2, 4, 8])
-    args.num_layers = random.randint(1, 6)
-    args.dim_feedforward = round(2 ** random.uniform(8, 12))
+    # args.d_model = round(2 ** random.uniform(5, 11)) // 8 * 8
+    # args.num_heads = random.choice([2, 4, 8])
+    # args.num_layers = random.randint(1, 6)
+    # args.dim_feedforward = round(2 ** random.uniform(8, 12))
+
     # barspoon
     # args.num_encoder_heads = random.choice([2, 4, 8])
     # args.num_decoder_heads = random.choice([2, 4, 8])
     # args.num_layers = random.randint(1, 6)
     # args.d_model = round(2 ** random.uniform(5, 11)) // 8 * 8
     # args.dim_feedforward = round(2 ** random.uniform(8, 12))
+
     # other
-    args.instances_per_bag = round(2 ** random.uniform(9, 12))
-    args.learning_rate = 10 ** (random.uniform(-3, -5))
+    # args.instances_per_bag = round(2 ** random.uniform(9, 12))
+    # args.learning_rate = 10 ** (random.uniform(-3, -5))
     batch_size = 4
 
     clini_df = read_table(
@@ -564,17 +567,18 @@ if __name__ == "__main__":
         patient_slides, left_on="PATIENT", right_index=True
     ).reset_index()
 
-    with open(args.target_file) as targets_file:
-        target_labels = np.array(
-            [target_label.strip() for target_label in targets_file]
-        )
+    # with open(args.target_file) as targets_file:
+    #     target_labels = np.array(
+    #         [target_label.strip() for target_label in targets_file]
+    #     )
 
-    target_labels = target_labels[cohort_df[target_labels].nunique(dropna=True) == 2]
-    target_labels = (
-        cohort_df[target_labels]
-        .select_dtypes(["int16", "int32", "int64", "float16", "float32", "float64"])
-        .columns.values
-    )
+    # target_labels = target_labels[cohort_df[target_labels].nunique(dropna=True) == 2]
+    # target_labels = (
+    #     cohort_df[target_labels]
+    #     .select_dtypes(["int16", "int32", "int64", "float16", "float32", "float64"])
+    #     .columns.values
+    # )
+    target_labels = [args.target_label]
 
     targets = torch.Tensor(cohort_df[target_labels].apply(pd.to_numeric).values)
     bags = cohort_df.slide_path.values
