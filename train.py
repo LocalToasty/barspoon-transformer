@@ -3,6 +3,7 @@ import argparse
 import os
 import shutil
 from pathlib import Path
+
 import numpy as np
 
 if __name__ == "__main__":
@@ -79,6 +80,8 @@ if __name__ == "__main__":
         patient_slides, left_on="PATIENT", right_index=True
     ).reset_index()
 
+    assert len(cohort_df["PATIENT"]) == cohort_df["PATIENT"].nunique()
+
     # TODO fail deadly
     target_labels = np.array(args.target_labels)
     target_labels = target_labels[cohort_df[target_labels].nunique(dropna=True) == 2]
@@ -88,13 +91,15 @@ if __name__ == "__main__":
         .columns.values
     )
 
-    targets = torch.tensor(cohort_df[target_labels].apply(pd.to_numeric).values, dtype=torch.float32)
+    targets = torch.tensor(
+        cohort_df[target_labels].apply(pd.to_numeric).values, dtype=torch.float32
+    )
     bags = cohort_df.slide_path.values
     pos_samples = targets.nansum(dim=0)
     neg_samples = (1 - targets).nansum(dim=0)
     pos_weight = neg_samples / pos_samples
 
-    train_idx, valid_idx = train_test_split(np.arange(len(targets)), test_size=.2)
+    train_idx, valid_idx = train_test_split(np.arange(len(targets)), test_size=0.2)
 
     if (args.output_dir / "done").exists():
         # already done...
@@ -139,7 +144,9 @@ if __name__ == "__main__":
     trainer = pl.Trainer(
         default_root_dir=args.output_dir,
         callbacks=[
-            EarlyStopping(monitor="val_TopKMultilabelAUROC", mode="max", patience=args.patience),
+            EarlyStopping(
+                monitor="val_TopKMultilabelAUROC", mode="max", patience=args.patience
+            ),
             ModelCheckpoint(
                 monitor="val_TopKMultilabelAUROC",
                 mode="max",
@@ -155,7 +162,13 @@ if __name__ == "__main__":
 
     trainer.fit(model=model, train_dataloaders=train_dl, val_dataloaders=valid_dl)
 
-    predictions = trainer.predict(model=model, dataloaders=valid_dl)
+    predictions = torch.cat(trainer.predict(model=model, dataloaders=valid_dl))  # type: ignore
+    preds_df = cohort_df.iloc[valid_idx][["PATIENT", *target_labels]]
+    for target_label, score in zip(target_labels, predictions.transpose(1, 0)):
+        preds_df[f"{target_label}_1"] = score
+        preds_df[f"{target_label}_0"] = 1 - score
+
+    preds_df.to_csv(args.output_dir / "valid-patient-preds.csv", index=False)
 
     with open(args.output_dir / "done", "w"):
         pass

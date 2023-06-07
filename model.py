@@ -265,7 +265,7 @@ class TopKMultilabelAUROC(torchmetrics.classification.MultilabelPrecisionRecallC
         self.average = average
 
     def compute(self) -> Tensor:  # type: ignore
-        state = (dim_zero_cat(self.preds), dim_zero_cat(self.target)) # type: ignore
+        state = (dim_zero_cat(self.preds), dim_zero_cat(self.target))  # type: ignore
         individual_aurocs = _multilabel_auroc_compute(
             state, self.num_labels, average="none", thresholds=None
         )
@@ -273,9 +273,9 @@ class TopKMultilabelAUROC(torchmetrics.classification.MultilabelPrecisionRecallC
         topk_idx = select_topk(individual_aurocs, self.topk, dim=0).bool()
 
         state = (
-                dim_zero_cat(self.preds)[:, topk_idx],  # type: ignore
-                dim_zero_cat(self.target)[:, topk_idx], # type: ignore
-            )
+            dim_zero_cat(self.preds)[:, topk_idx],  # type: ignore
+            dim_zero_cat(self.target)[:, topk_idx],  # type: ignore
+        )
         auroc = _multilabel_auroc_compute(
             state, self.topk, average=self.average, thresholds=None
         )
