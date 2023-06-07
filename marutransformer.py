@@ -15,14 +15,16 @@ if __name__ == "__main__":
     parser.add_argument("--clini-table", type=Path, required=True)
     parser.add_argument("--slide-table", type=Path, required=True)
     parser.add_argument("--feature-dir", type=Path, required=True)
-    # parser.add_argument("--target-file", type=Path, required=True)
-    parser.add_argument("target-label", type=str, required=True)
+    parser.add_argument("--target-file", type=Path, required=True)
+    # parser.add_argument("--target-label", type=str, required=True)
     parser.add_argument("--num-heads", type=int, default=8)
     parser.add_argument("--num-encoder-heads", type=int, default=8)
     parser.add_argument("--num-decoder-heads", type=int, default=8)
-    parser.add_argument("--num-layers", type=int, default=3)
+    # parser.add_argument("--num-layers", type=int, default=3)
+    parser.add_argument("--num-encoder-layers", type=int, default=2)
+    parser.add_argument("--num-decoder-layers", type=int, default=2)
     parser.add_argument("--d-model", type=int, default=512)
-    parser.add_argument("--dim-feedforward", type=int, default=3e3)
+    parser.add_argument("--dim-feedforward", type=int, default=2048)
     parser.add_argument("--instances-per-bag", type=int, default=2**12)
     parser.add_argument("--learning-rate", type=float, default=1e-4)
     args = parser.parse_args()
@@ -40,6 +42,8 @@ from torch import nn
 from torch.utils.data import DataLoader, Dataset
 from torchmetrics.functional.classification.auroc import _multilabel_auroc_compute
 from torchmetrics.utilities.data import dim_zero_cat, select_topk
+
+torch.set_float32_matmul_precision("medium")
 
 
 class ParallelLinear(nn.Module):
@@ -208,6 +212,75 @@ class VisionTransformer(nn.Module):
 
         # apply the corresponding head to each class token
         logits = self.heads(encoded[:, :out_features, :]).squeeze(-1)
+
+        return logits
+
+
+class EncoderDecoderTransformer(nn.Module):
+    def __init__(
+        self,
+        d_features: int,
+        n_targets: int,
+        *,
+        d_model: int = 512,
+        num_encoder_heads: int = 8,
+        num_decoder_heads: int = 8,
+        num_encoder_layers: int = 2,
+        num_decoder_layers: int = 2,
+        dim_feedforward: int = 2048,
+    ) -> None:
+        """
+             ┏━━┓      ┏━━┓           ┏━━┓
+        t ─▶┃E0┠──┬─▶┃E1┠──┬──···─▶┃En┠──┐
+             ┗━━┛  │   ┗━━┛  │        ┗━━┛  │
+                   ▼         ▼              ▼
+                 ┏━━┓      ┏━━┓           ┏━━┓   ┏━━┓
+        c ─────▶┃D0┠────▶┃D1┠─···─────▶┃Dn┠─▶┃FC┠─▶ s
+                 ┗━━┛      ┗━━┛           ┗━━┛   ┗━━┛
+        """
+        super().__init__()
+
+        # one class token per output class
+        self.class_tokens = nn.Parameter(torch.rand(n_targets, d_model))
+
+        self.projector = nn.Sequential(nn.Linear(d_features, d_model), nn.ReLU())
+
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=num_encoder_heads,
+            dim_feedforward=dim_feedforward,
+            batch_first=True,
+            norm_first=True,
+        )
+        self.transformer_encoder = nn.TransformerEncoder(
+            encoder_layer, num_layers=num_encoder_layers
+        )
+        decoder_layer = nn.TransformerDecoderLayer(
+            d_model=d_model,
+            nhead=num_decoder_heads,
+            dim_feedforward=dim_feedforward,
+            batch_first=True,
+            norm_first=True,
+        )
+        self.transformer_decoder = nn.TransformerDecoder(
+            decoder_layer, num_layers=num_decoder_layers
+        )
+
+        self.heads = ParallelLinear(
+            in_features=d_model, out_features=1, n_parallel=n_targets
+        )
+
+    def forward(self, tile_tokens):
+        batch_size, _, _ = tile_tokens.shape
+
+        tile_tokens = self.projector(tile_tokens)  # shape: [bs, seq_len, d_model]
+        tile_tokens = self.transformer_encoder(tile_tokens)
+
+        class_tokens = self.class_tokens.expand(batch_size, -1, -1)
+        class_tokens = self.transformer_decoder(tgt=class_tokens, memory=tile_tokens)
+
+        # apply the corresponding head to each class token
+        logits = self.heads(class_tokens).squeeze(-1)
 
         return logits
 
@@ -396,6 +469,48 @@ class LitMilClassificationMixin(pl.LightningModule):
         return optimizer
 
 
+class LitEncoderDecoderTransformer(LitMilClassificationMixin):
+    def __init__(
+        self,
+        *,
+        d_features: int,
+        target_labels: Sequence[str],
+        pos_weight: Optional[torch.Tensor],
+        # model parameters
+        d_model: int,  # = 512,
+        num_encoder_heads: int,  # = 8,
+        num_decoder_heads: int,  # = 8,
+        num_encoder_layers: int,  # = 2,
+        num_decoder_layers: int,  # = 2,
+        dim_feedforward: int,  # = 2048,
+        # other hparams
+        learning_rate: float,  # = 1e-4,
+        **hparams: Any,
+    ) -> None:
+        super().__init__(
+            target_labels=target_labels,
+            pos_weight=pos_weight,
+            learning_rate=learning_rate,
+        )
+        _ = hparams  # so we don't get unused parameter warnings
+
+        self.model = EncoderDecoderTransformer(
+            d_features=d_features,
+            n_targets=len(target_labels),
+            d_model=d_model,
+            num_encoder_heads=num_encoder_heads,
+            num_decoder_heads=num_decoder_heads,
+            num_encoder_layers=num_encoder_layers,
+            num_decoder_layers=num_decoder_layers,
+            dim_feedforward=dim_feedforward,
+        )
+
+        self.save_hyperparameters()
+
+    def forward(self, tile_tokens):
+        return self.model(tile_tokens)
+
+
 class LitBarspoonTransformer(LitMilClassificationMixin):
     def __init__(
         self,
@@ -567,18 +682,18 @@ if __name__ == "__main__":
         patient_slides, left_on="PATIENT", right_index=True
     ).reset_index()
 
-    # with open(args.target_file) as targets_file:
-    #     target_labels = np.array(
-    #         [target_label.strip() for target_label in targets_file]
-    #     )
+    with open(args.target_file) as targets_file:
+        target_labels = np.array(
+            [target_label.strip() for target_label in targets_file]
+        )
 
-    # target_labels = target_labels[cohort_df[target_labels].nunique(dropna=True) == 2]
-    # target_labels = (
-    #     cohort_df[target_labels]
-    #     .select_dtypes(["int16", "int32", "int64", "float16", "float32", "float64"])
-    #     .columns.values
-    # )
-    target_labels = [args.target_label]
+    target_labels = target_labels[cohort_df[target_labels].nunique(dropna=True) == 2]
+    target_labels = (
+        cohort_df[target_labels]
+        .select_dtypes(["int16", "int32", "int64", "float16", "float32", "float64"])
+        .columns.values
+    )
+    # target_labels = [args.target_label]
 
     targets = torch.Tensor(cohort_df[target_labels].apply(pd.to_numeric).values)
     bags = cohort_df.slide_path.values
@@ -629,7 +744,7 @@ if __name__ == "__main__":
         example_bags, _ = next(iter(train_dl))
         d_features = example_bags.size(-1)
 
-        model = LitVisionTransformer(
+        model = LitEncoderDecoderTransformer(
             d_features=d_features,
             n_targets=len(target_labels),
             pos_weight=pos_weight,
