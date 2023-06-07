@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-# %%
 import argparse
 import os
 import shutil
 from pathlib import Path
+import numpy as np
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -11,7 +11,6 @@ if __name__ == "__main__":
     parser.add_argument("--clini-table", type=Path, required=True)
     parser.add_argument("--slide-table", type=Path, required=True)
     parser.add_argument("--feature-dir", type=Path, required=True)
-    parser.add_argument("--target-file", type=Path, required=True)
     parser.add_argument(
         "--target-label", type=str, required=True, action="append", dest="target_labels"
     )
@@ -30,6 +29,8 @@ if __name__ == "__main__":
     training_parser.add_argument(
         "--num-workers", type=int, default=min(os.cpu_count() or 0, 8)
     )
+    training_parser.add_argument("--patience", type=int, default=16)
+    training_parser.add_argument("--max-epochs", type=int, default=256)
     args = parser.parse_args()
 
 import pandas as pd
@@ -51,8 +52,8 @@ def read_table(path: Path, dtype=str) -> pd.DataFrame:
         return pd.read_excel(path, dtype=dtype)
 
 
-# %%
 if __name__ == "__main__":
+    pl.seed_everything(0)
     torch.set_float32_matmul_precision("medium")
 
     clini_df = read_table(
@@ -79,7 +80,7 @@ if __name__ == "__main__":
     ).reset_index()
 
     # TODO fail deadly
-    target_labels = args.target_labels
+    target_labels = np.array(args.target_labels)
     target_labels = target_labels[cohort_df[target_labels].nunique(dropna=True) == 2]
     target_labels = (
         cohort_df[target_labels]
@@ -87,13 +88,13 @@ if __name__ == "__main__":
         .columns.values
     )
 
-    targets = torch.Tensor(cohort_df[target_labels].apply(pd.to_numeric).values)
+    targets = torch.tensor(cohort_df[target_labels].apply(pd.to_numeric).values, dtype=torch.float32)
     bags = cohort_df.slide_path.values
     pos_samples = targets.nansum(dim=0)
     neg_samples = (1 - targets).nansum(dim=0)
     pos_weight = neg_samples / pos_samples
 
-    train_idx, valid_idx = train_test_split(df.index, test_size=0.2)
+    train_idx, valid_idx = train_test_split(np.arange(len(targets)), test_size=.2)
 
     if (args.output_dir / "done").exists():
         # already done...
@@ -130,7 +131,6 @@ if __name__ == "__main__":
         n_targets=len(target_labels),
         pos_weight=pos_weight,
         # other hparams
-        target_labels=list(target_labels),
         train_patients=list(cohort_df.loc[train_idx].PATIENT),
         valid_patients=list(cohort_df.loc[valid_idx].PATIENT),
         **vars(args),
@@ -139,13 +139,14 @@ if __name__ == "__main__":
     trainer = pl.Trainer(
         default_root_dir=args.output_dir,
         callbacks=[
-            EarlyStopping(monitor="val_TopKMultilabelAUROC", mode="max", patience=16),
+            EarlyStopping(monitor="val_TopKMultilabelAUROC", mode="max", patience=args.patience),
             ModelCheckpoint(
                 monitor="val_TopKMultilabelAUROC",
                 mode="max",
                 filename="checkpoint-{epoch:02d}-{val_TopKMultilabelAUROC:0.3f}",
             ),
         ],
+        max_epochs=args.max_epochs,
         accelerator="auto",
         accumulate_grad_batches=args.accumulate_grad_samples // args.batch_size,
         gradient_clip_val=0.5,
@@ -153,6 +154,8 @@ if __name__ == "__main__":
     )
 
     trainer.fit(model=model, train_dataloaders=train_dl, val_dataloaders=valid_dl)
+
+    predictions = trainer.predict(model=model, dataloaders=valid_dl)
 
     with open(args.output_dir / "done", "w"):
         pass

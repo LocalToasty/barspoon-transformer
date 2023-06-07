@@ -231,9 +231,12 @@ class LitMilClassificationMixin(pl.LightningModule):
         return self.step(batch, step_name="test")
 
     def predict_step(self, batch, batch_idx, dataloader_idx=0):
-        bag, targets = batch
+        if isinstance(batch, Tensor):
+            bag = batch
+        else:
+            bag, _ = batch
         logits = self(bag)
-        return torch.sigmoid(logits), targets
+        return torch.sigmoid(logits)
 
     def configure_optimizers(self):
         optimizer = torch.optim.Adam(self.parameters(), lr=self.learning_rate)
@@ -262,20 +265,17 @@ class TopKMultilabelAUROC(torchmetrics.classification.MultilabelPrecisionRecallC
         self.average = average
 
     def compute(self) -> Tensor:  # type: ignore
-        assert isinstance(self.preds, Tensor) and isinstance(self.target, Tensor)
-        state = torch.tensor([dim_zero_cat(self.preds), dim_zero_cat(self.target)])
+        state = (dim_zero_cat(self.preds), dim_zero_cat(self.target)) # type: ignore
         individual_aurocs = _multilabel_auroc_compute(
             state, self.num_labels, average="none", thresholds=None
         )
         assert isinstance(individual_aurocs, Tensor)
         topk_idx = select_topk(individual_aurocs, self.topk, dim=0).bool()
 
-        state = torch.tensor(
-            [
-                dim_zero_cat(self.preds)[:, topk_idx],
-                dim_zero_cat(self.target)[:, topk_idx],
-            ]
-        )
+        state = (
+                dim_zero_cat(self.preds)[:, topk_idx],  # type: ignore
+                dim_zero_cat(self.target)[:, topk_idx], # type: ignore
+            )
         auroc = _multilabel_auroc_compute(
             state, self.topk, average=self.average, thresholds=None
         )

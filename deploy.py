@@ -1,4 +1,3 @@
-# %%
 import argparse
 import math
 import re
@@ -17,7 +16,7 @@ import torch.nn.functional as F
 import torchmetrics
 from pytorch_lightning.loggers import CSVLogger
 
-from marutransformer import BagDataset, LitBarspoonTransformer, read_table
+from train import BagDataset, LitBarspoonTransformer, read_table
 
 # %%
 # %%
