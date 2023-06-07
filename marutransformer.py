@@ -8,6 +8,7 @@ from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, Optional, Tuple
+from sklearn.preprocessing import LabelEncoder
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -19,10 +20,10 @@ if __name__ == "__main__":
     parser.add_argument("--num-heads", type=int, default=8)
     parser.add_argument("--num-encoder-heads", type=int, default=8)
     parser.add_argument("--num-decoder-heads", type=int, default=8)
-    parser.add_argument("--num-layers", type=int, default=2)
+    parser.add_argument("--num-layers", type=int, default=4)
     parser.add_argument("--d-model", type=int, default=512)
     parser.add_argument("--dim-feedforward", type=int, default=2048)
-    parser.add_argument("--instances-per-bag", type=int, default=2**10)
+    parser.add_argument("--instances-per-bag", type=int, default=2**11)
     parser.add_argument("--learning-rate", type=float, default=1e-4)
     args = parser.parse_args()
 
@@ -526,10 +527,10 @@ import random
 
 if __name__ == "__main__":
     # vision
-    args.d_model = round(2 ** random.uniform(5, 11)) // 8 * 8
-    args.num_heads = random.choice([2, 4, 8])
-    args.num_layers = random.randint(1, 6)
-    args.dim_feedforward = round(2 ** random.uniform(8, 12))
+    # args.d_model = round(2 ** random.uniform(5, 11)) // 8 * 8
+    # args.num_heads = random.choice([2, 4, 8])
+    # args.num_layers = random.randint(1, 6)
+    # args.dim_feedforward = round(2 ** random.uniform(8, 12))
     # barspoon
     # args.num_encoder_heads = random.choice([2, 4, 8])
     # args.num_decoder_heads = random.choice([2, 4, 8])
@@ -537,8 +538,8 @@ if __name__ == "__main__":
     # args.d_model = round(2 ** random.uniform(5, 11)) // 8 * 8
     # args.dim_feedforward = round(2 ** random.uniform(8, 12))
     # other
-    args.instances_per_bag = round(2 ** random.uniform(9, 12))
-    args.learning_rate = 10 ** (random.uniform(-3, -5))
+    # args.instances_per_bag = round(2 ** random.uniform(9, 12))
+    # args.learning_rate = 10 ** (random.uniform(-3, -5))
     batch_size = 4
 
     clini_df = read_table(
@@ -568,7 +569,9 @@ if __name__ == "__main__":
         target_labels = np.array(
             [target_label.strip() for target_label in targets_file]
         )
-
+    encoder = LabelEncoder()
+    for target_label in target_labels:
+        cohort_df[target_label] = encoder.fit_transform(cohort_df[target_label])
     target_labels = target_labels[cohort_df[target_labels].nunique(dropna=True) == 2]
     target_labels = (
         cohort_df[target_labels]
