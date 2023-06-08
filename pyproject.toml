@@ -30,3 +30,7 @@ dependencies = [
 [project.urls]
 "Homepage" = "https://github.com/KatherLab/barspoon-transformer"
 "Bug Tracker" = "https://github.com/KatherLab/barspoon-transformer/issues"
+
+[project.scripts]
+"barspoon-train" = "barspoon.train:main"
+"barspoon-deploy" = "barspoon.deploy:main"

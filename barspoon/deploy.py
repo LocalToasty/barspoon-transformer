@@ -3,7 +3,15 @@ import argparse
 import os
 from pathlib import Path
 
-if __name__ == "__main__":
+import pytorch_lightning as pl
+import torch
+from torch.utils.data import DataLoader
+
+from .data import BagDataset
+from .model import LitEncDecTransformer
+from .utils import generate_dataset_df
+
+def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "-o",
@@ -62,15 +70,6 @@ if __name__ == "__main__":
     parser.add_argument("--num-workers", type=int, default=min(os.cpu_count() or 0, 8))
     args = parser.parse_args()
 
-import pytorch_lightning as pl
-import torch
-from torch.utils.data import DataLoader
-
-from .data import BagDataset
-from .model import LitEncDecTransformer
-from .utils import generate_dataset_df
-
-if __name__ == "__main__":
     pl.seed_everything(0)
     torch.set_float32_matmul_precision("medium")
 
@@ -126,3 +125,6 @@ if __name__ == "__main__":
     # save results
     args.output_dir.mkdir(exist_ok=True, parents=True)
     preds_df.to_csv(args.output_dir / "patient-preds.csv")
+
+if __name__ == "__main__":
+    main()

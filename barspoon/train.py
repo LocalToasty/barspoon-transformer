@@ -1,9 +1,24 @@
 #!/usr/bin/env python3
 import argparse
 import os
+import shutil
 from pathlib import Path
 
-if __name__ == "__main__":
+import numpy as np
+import pandas as pd
+import pytorch_lightning as pl
+import torch
+from pytorch_lightning.callbacks import EarlyStopping, ModelCheckpoint
+from pytorch_lightning.loggers import CSVLogger
+from sklearn.model_selection import train_test_split
+from torch.utils.data import DataLoader
+
+from .data import BagDataset
+from .model import LitEncDecTransformer
+from .utils import generate_dataset_df
+
+
+def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "-o",
@@ -86,23 +101,6 @@ if __name__ == "__main__":
     training_parser.add_argument("--max-epochs", type=int, default=256)
     args = parser.parse_args()
 
-import shutil
-
-import numpy as np
-import pandas as pd
-import pytorch_lightning as pl
-import torch
-from pytorch_lightning.callbacks import EarlyStopping, ModelCheckpoint
-from pytorch_lightning.loggers import CSVLogger
-from sklearn.model_selection import train_test_split
-from torch.utils.data import DataLoader
-
-from .data import BagDataset
-from .model import LitEncDecTransformer
-from .utils import generate_dataset_df
-
-
-if __name__ == "__main__":
     pl.seed_everything(0)
     torch.set_float32_matmul_precision("medium")
 
@@ -206,3 +204,7 @@ if __name__ == "__main__":
 
     with open(args.output_dir / "done", "w"):
         pass
+
+
+if __name__ == "__main__":
+    main()
