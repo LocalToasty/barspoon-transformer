@@ -1,19 +1,64 @@
 #!/usr/bin/env python3
 import argparse
 import os
-import shutil
 from pathlib import Path
-
-import numpy as np
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--output-dir", type=Path, required=True)
-    parser.add_argument("--clini-table", type=Path, required=True)
-    parser.add_argument("--slide-table", type=Path, required=True)
-    parser.add_argument("--feature-dir", type=Path, required=True)
     parser.add_argument(
-        "--target-label", type=str, required=True, action="append", dest="target_labels"
+        "-o",
+        "--output-dir",
+        metavar="PATH",
+        type=Path,
+        required=True,
+        help="Directory path for the output",
+    )
+    parser.add_argument(
+        "-c",
+        "--clini-table",
+        metavar="PATH",
+        type=Path,
+        help="Path to the clinical table",
+    )
+    parser.add_argument(
+        "-s", "--slide-table", metavar="PATH", type=Path, help="Path to the slide table"
+    )
+    parser.add_argument(
+        "-f",
+        "--feature-dir",
+        metavar="PATH",
+        type=Path,
+        required=True,
+        help="Path containing the slide features as `h5` files",
+    )
+    parser.add_argument(
+        "-t",
+        "--target-label",
+        type=str,
+        required=True,
+        action="append",
+        dest="target_labels",
+        help="Target labels to train for. Can be specified multiple times",
+    )
+    parser.add_argument(
+        "--patient-col",
+        metavar="COL",
+        type=str,
+        default="PATIENT",
+        help="Name of the patient column",
+    )
+    parser.add_argument(
+        "--slide-col",
+        metavar="COL",
+        type=str,
+        default="FILENAME",
+        help="Name of the slide column",
+    )
+    parser.add_argument(
+        "--group-by",
+        metavar="COL",
+        type=str,
+        help="How to group slides. If 'clini' table is given, default is 'patient'; otherwise, default is 'slide'",
     )
     model_parser = parser.add_argument_group("model options")
     model_parser.add_argument("--num-encoder-heads", type=int, default=8)
@@ -34,6 +79,9 @@ if __name__ == "__main__":
     training_parser.add_argument("--max-epochs", type=int, default=256)
     args = parser.parse_args()
 
+import shutil
+
+import numpy as np
 import pandas as pd
 import pytorch_lightning as pl
 import torch
@@ -44,6 +92,7 @@ from torch.utils.data import DataLoader
 
 from data import BagDataset
 from model import LitEncDecTransformer
+from utils import generate_dataset_df
 
 
 def read_table(path: Path, dtype=str) -> pd.DataFrame:
@@ -57,49 +106,34 @@ if __name__ == "__main__":
     pl.seed_everything(0)
     torch.set_float32_matmul_precision("medium")
 
-    clini_df = read_table(
-        args.clini_table,
-        dtype={"PATIENT": str},
+    dataset_df = generate_dataset_df(
+        clini_table=args.clini_table,
+        slide_table=args.slide_table,
+        feature_dir=args.feature_dir,
+        patient_col=args.patient_col,
+        slide_col=args.slide_col,
+        group_by=args.group_by,
+        target_labels=args.target_labels,
     )
-    slide_df = read_table(
-        args.slide_table,
-    )[["PATIENT", "FILENAME"]]
-    df = clini_df.merge(slide_df, on="PATIENT")
-    assert not df.empty, "no overlap between clini and slide table."
-
-    # remove slides we don't have
-    h5s = set(args.feature_dir.glob("*.h5"))
-    assert h5s, f"no features found in {args.feature_dir}!"
-    h5_df = pd.DataFrame(h5s, columns=["slide_path"])
-    h5_df["FILENAME"] = h5_df.slide_path.map(lambda p: p.stem)
-    cohort_df = df.merge(h5_df, on="FILENAME").reset_index()
-    # reduce to one row per patient with list of slides in `df['slide_path']`
-    patient_df = cohort_df.groupby("PATIENT").first().drop(columns="slide_path")
-    patient_slides = cohort_df.groupby("PATIENT").slide_path.apply(list)
-    cohort_df = patient_df.merge(
-        patient_slides, left_on="PATIENT", right_index=True
-    ).reset_index()
-
-    assert len(cohort_df["PATIENT"]) == cohort_df["PATIENT"].nunique()
 
     # TODO fail deadly
     target_labels = np.array(args.target_labels)
-    target_labels = target_labels[cohort_df[target_labels].nunique(dropna=True) == 2]
+    target_labels = target_labels[dataset_df[target_labels].nunique(dropna=True) == 2]
     target_labels = (
-        cohort_df[target_labels]
+        dataset_df[target_labels]
         .select_dtypes(["int16", "int32", "int64", "float16", "float32", "float64"])
         .columns.values
     )
 
     targets = torch.tensor(
-        cohort_df[target_labels].apply(pd.to_numeric).values, dtype=torch.float32
+        dataset_df[target_labels].apply(pd.to_numeric).values, dtype=torch.float32
     )
-    bags = cohort_df.slide_path.values
+    bags = dataset_df.path.values
     pos_samples = targets.nansum(dim=0)
     neg_samples = (1 - targets).nansum(dim=0)
     pos_weight = neg_samples / pos_samples
 
-    train_idx, valid_idx = train_test_split(np.arange(len(targets)), test_size=0.2)
+    train_items, valid_items = train_test_split(dataset_df.index, test_size=0.2)
 
     if (args.output_dir / "done").exists():
         # already done...
@@ -109,8 +143,8 @@ if __name__ == "__main__":
         shutil.rmtree(args.output_dir)
 
     train_ds = BagDataset(
-        bags[train_idx],
-        targets[train_idx],
+        bags=dataset_df.path.loc[train_items].values,
+        targets=torch.tensor(dataset_df.loc[train_items, target_labels].apply(pd.to_numeric).values),  # type: ignore
         instances_per_bag=args.instances_per_bag,
         deterministic=False,
     )
@@ -119,8 +153,8 @@ if __name__ == "__main__":
     )
 
     valid_ds = BagDataset(
-        bags[valid_idx],
-        targets[valid_idx],
+        bags=dataset_df.path.loc[valid_items].values,
+        targets=torch.tensor(dataset_df.loc[valid_items, target_labels].apply(pd.to_numeric).values),  # type: ignore
         instances_per_bag=args.instances_per_bag,
         deterministic=True,
     )
@@ -136,8 +170,8 @@ if __name__ == "__main__":
         n_targets=len(target_labels),
         pos_weight=pos_weight,
         # other hparams
-        train_patients=list(cohort_df.loc[train_idx].PATIENT),
-        valid_patients=list(cohort_df.loc[valid_idx].PATIENT),
+        training_set=list(train_items),
+        validation_set=list(valid_items),
         **vars(args),
     )
 
@@ -162,13 +196,13 @@ if __name__ == "__main__":
 
     trainer.fit(model=model, train_dataloaders=train_dl, val_dataloaders=valid_dl)
 
-    predictions = torch.cat(trainer.predict(model=model, dataloaders=valid_dl))  # type: ignore
-    preds_df = cohort_df.iloc[valid_idx][["PATIENT", *target_labels]]
+    predictions = torch.cat(trainer.predict(model=model, dataloaders=valid_dl, return_predictions=True))  # type: ignore
+    preds_df = dataset_df.loc[valid_items, target_labels]  # type: ignore
     for target_label, score in zip(target_labels, predictions.transpose(1, 0)):
         preds_df[f"{target_label}_1"] = score
         preds_df[f"{target_label}_0"] = 1 - score
 
-    preds_df.to_csv(args.output_dir / "valid-patient-preds.csv", index=False)
+    preds_df.to_csv(args.output_dir / "valid-patient-preds.csv")
 
     with open(args.output_dir / "done", "w"):
         pass

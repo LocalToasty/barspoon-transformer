@@ -1,75 +1,135 @@
+#!/usr/bin/env python3
+# %%
 import argparse
-import math
-import re
-import shutil
-from collections.abc import Iterable, Sequence
-from dataclasses import dataclass
+import os
 from pathlib import Path
-from typing import Any, Literal, Optional, Tuple
 
-import h5py
-import numpy as np
-import pandas as pd
-import pytorch_lightning as pl
-import torch
-import torch.nn.functional as F
-import torchmetrics
-from pytorch_lightning.loggers import CSVLogger
-
-from train import BagDataset, LitBarspoonTransformer, read_table
-
-# %%
-# %%
-
-# %%
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--output-dir", type=Path, required=True)
-    parser.add_argument("--clini-table", type=Path, required=True)
-    parser.add_argument("--slide-table", type=Path, required=True)
-    parser.add_argument("--feature-dir", type=Path, required=True)
-    parser.add_argument("--model-ckpt", type=Path, required=True)
+    parser.add_argument(
+        "-o",
+        "--output-dir",
+        metavar="PATH",
+        type=Path,
+        required=True,
+        help="Directory path for the output",
+    )
+    parser.add_argument(
+        "-c",
+        "--clini-table",
+        metavar="PATH",
+        type=Path,
+        help="Path to the clinical table",
+    )
+    parser.add_argument(
+        "-s", "--slide-table", metavar="PATH", type=Path, help="Path to the slide table"
+    )
+    parser.add_argument(
+        "-f",
+        "--feature-dir",
+        metavar="PATH",
+        type=Path,
+        required=True,
+        help="Path containing the slide features as `h5` files",
+    )
+    parser.add_argument(
+        "-m",
+        "--checkpoint-path",
+        metavar="PATH",
+        type=Path,
+        required=True,
+        help="Path to the checkpoint file",
+    )
+    parser.add_argument(
+        "--patient-col",
+        metavar="COL",
+        type=str,
+        default="PATIENT",
+        help="Name of the patient column",
+    )
+    parser.add_argument(
+        "--slide-col",
+        metavar="COL",
+        type=str,
+        default="FILENAME",
+        help="Name of the slide column",
+    )
+    parser.add_argument(
+        "--group-by",
+        metavar="COL",
+        type=str,
+        help="How to group slides. If 'clini' table is given, default is 'patient'; otherwise, default is 'slide'",
+    )
+    parser.add_argument("--num-workers", type=int, default=min(os.cpu_count() or 0, 8))
     args = parser.parse_args()
 
-    model = LitBarspoonTransformer.load_from_checkpoint(args.model_ckpt)
+import numpy as np
+import pytorch_lightning as pl
+import torch
+from torch.utils.data import DataLoader
 
-    clini_df = read_table(
-        args.clini_table,
-        dtype={"PATIENT": str},
+from data import BagDataset
+from model import LitEncDecTransformer
+from utils import generate_dataset_df
+
+if __name__ == "__main__":
+    pl.seed_everything(0)
+    torch.set_float32_matmul_precision("medium")
+
+    model = LitEncDecTransformer.load_from_checkpoint(
+        checkpoint_path=args.checkpoint_path
     )
-    slide_df = read_table(
-        args.slide_table,
-    )[["PATIENT", "FILENAME"]]
-    df = clini_df.merge(slide_df, on="PATIENT")
-    assert not df.empty, "no overlap between clini and slide table."
+    target_labels = model.hparams["target_labels"]
 
-    # remove slides we don't have
-    h5s = set(args.feature_dir.glob("*.h5"))
-    assert h5s, f"no features found in {args.feature_dir}!"
-    h5_df = pd.DataFrame(h5s, columns=["slide_path"])
-    h5_df["FILENAME"] = h5_df.slide_path.map(lambda p: p.stem)
-    cohort_df = df.merge(h5_df, on="FILENAME").reset_index()
-    # reduce to one row per patient with list of slides in `df['slide_path']`
-    patient_df = cohort_df.groupby("PATIENT").first().drop(columns="slide_path")
-    patient_slides = cohort_df.groupby("PATIENT").slide_path.apply(list)
-    cohort_df = patient_df.merge(
-        patient_slides, left_on="PATIENT", right_index=True
-    ).reset_index()
-
-    targets = torch.Tensor(cohort_df[model.target_labels].apply(pd.to_numeric).values)
-    bags = cohort_df.slide_path.values
-
-    test_ds = BagDataset(
-        bags,
-        targets,
-        instances_per_bag=2**12,
-        deterministic=True,
+    dataset_df = generate_dataset_df(
+        clini_table=args.clini_table,
+        slide_table=args.slide_table,
+        feature_dir=args.feature_dir,
+        patient_col=args.patient_col,
+        slide_col=args.slide_col,
+        group_by=args.group_by,
+        target_labels=target_labels,
     )
-    test_dl = DataLoader(test_ds, batch_size=1, num_workers=8)
+
+    # make a dataset with faux labels (the labels will be ignored)
+    ds = BagDataset(
+        bags=list(dataset_df.path),
+        targets=torch.zeros(len(dataset_df), 0),
+        instances_per_bag=None,
+    )
+    dl = DataLoader(ds, shuffle=False, num_workers=args.num_workers)
 
     trainer = pl.Trainer(
+        default_root_dir=args.output_dir,
         accelerator="auto",
-        logger=CSVLogger(save_dir=args.output_dir),
+        devices=1,
     )
+    predictions = torch.cat(trainer.predict(model=model, dataloaders=dl))  # type: ignore
 
-    trainer.test(model=model, dataloaders=test_dl)
+    preds_df = dataset_df.drop(columns="path")
+    for target_label, preds in zip(target_labels, predictions.transpose(1, 0)):
+        preds_df[f"{target_label}_0"] = 1 - preds
+        preds_df[f"{target_label}_1"] = preds
+
+    # calculate the element-wise loss
+    weight = model.loss.weight
+    pos_weight = model.loss.pos_weight
+
+    # all target labels for which we have clinical information
+    has_ground_truth = [t in dataset_df.columns for t in target_labels]
+
+    if any(has_ground_truth):
+        preds_df["loss"] = torch.nn.functional.binary_cross_entropy_with_logits(
+            input=predictions,
+            target=torch.tensor(
+                dataset_df[np.array(target_labels)[has_ground_truth]].values
+            ).type_as(predictions),
+            weight=weight[has_ground_truth] if weight is not None else None,
+            pos_weight=pos_weight[has_ground_truth] if pos_weight is not None else None,
+            reduction="none",
+        ).nanmean(dim=1)
+        preds_df = preds_df.sort_values(by="loss")
+
+    # save results
+    args.output_dir.mkdir(exist_ok=True, parents=True)
+    preds_df.to_csv(args.output_dir / "patient-preds.csv")
