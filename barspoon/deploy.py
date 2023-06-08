@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# %%
 import argparse
 import os
 from pathlib import Path
@@ -67,9 +66,9 @@ import pytorch_lightning as pl
 import torch
 from torch.utils.data import DataLoader
 
-from data import BagDataset
-from model import LitEncDecTransformer
-from utils import generate_dataset_df
+from .data import BagDataset
+from .model import LitEncDecTransformer
+from .utils import generate_dataset_df
 
 if __name__ == "__main__":
     pl.seed_everything(0)

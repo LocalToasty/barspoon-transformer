@@ -97,9 +97,9 @@ from pytorch_lightning.loggers import CSVLogger
 from sklearn.model_selection import train_test_split
 from torch.utils.data import DataLoader
 
-from data import BagDataset
-from model import LitEncDecTransformer
-from utils import generate_dataset_df
+from .data import BagDataset
+from .model import LitEncDecTransformer
+from .utils import generate_dataset_df
 
 
 if __name__ == "__main__":
