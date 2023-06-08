@@ -104,6 +104,12 @@ def main():
     pl.seed_everything(0)
     torch.set_float32_matmul_precision("medium")
 
+    if args.target_labels:
+        target_labels = args.target_labels
+    else:
+        with open(args.target_file) as f:
+            target_labels = [l.strip() for l in f if l]
+
     dataset_df = generate_dataset_df(
         clini_table=args.clini_table,
         slide_table=args.slide_table,
@@ -111,17 +117,18 @@ def main():
         patient_col=args.patient_col,
         slide_col=args.slide_col,
         group_by=args.group_by,
-        target_labels=args.target_labels,
+        target_labels=target_labels,
     )
 
     # TODO fail deadly
-    target_labels = np.array(args.target_labels)
+    target_labels = np.array(target_labels)
     target_labels = target_labels[dataset_df[target_labels].nunique(dropna=True) == 2]
     target_labels = (
         dataset_df[target_labels]
         .select_dtypes(["int16", "int32", "int64", "float16", "float32", "float64"])
         .columns.values
     )
+    print(target_labels)
 
     targets = torch.tensor(
         dataset_df[target_labels].apply(pd.to_numeric).values, dtype=torch.float32
@@ -165,12 +172,12 @@ def main():
 
     model = LitEncDecTransformer(
         d_features=d_features,
-        n_targets=len(target_labels),
+        target_labels=target_labels,
         pos_weight=pos_weight,
         # other hparams
         training_set=list(train_items),
         validation_set=list(valid_items),
-        **vars(args),
+        **{k: v for k, v in vars(args).items() if k not in {"target_labels"}},
     )
 
     trainer = pl.Trainer(
@@ -194,11 +201,31 @@ def main():
 
     trainer.fit(model=model, train_dataloaders=train_dl, val_dataloaders=valid_dl)
 
+    # TODO factor out
     predictions = torch.cat(trainer.predict(model=model, dataloaders=valid_dl, return_predictions=True))  # type: ignore
-    preds_df = dataset_df.loc[valid_items, target_labels]  # type: ignore
-    for target_label, score in zip(target_labels, predictions.transpose(1, 0)):
-        preds_df[f"{target_label}_1"] = score
-        preds_df[f"{target_label}_0"] = 1 - score
+    preds_df = pd.concat(
+        [
+            dataset_df.loc[valid_items, target_labels],  # type: ignore
+            *[
+                pd.DataFrame(
+                    {f"{target_label}_1": score, f"{target_label}_0": 1 - score},
+                    index=valid_items,
+                )
+                for target_label, score in zip(
+                    target_labels, predictions.transpose(1, 0)
+                )
+            ],
+        ],
+        axis=1,
+    ).copy()
+    preds_df["loss"] = torch.nn.functional.binary_cross_entropy_with_logits(
+        predictions,
+        predictions,
+        weight=model.loss.weight,
+        pos_weight=model.loss.pos_weight,
+        reduction="none",
+    ).nanmean(dim=1)
+    preds_df = preds_df.sort_values(by="loss")
 
     preds_df.to_csv(args.output_dir / "valid-patient-preds.csv")
 

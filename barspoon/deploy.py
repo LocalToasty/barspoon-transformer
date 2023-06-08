@@ -11,6 +11,7 @@ from .data import BagDataset
 from .model import LitEncDecTransformer
 from .utils import generate_dataset_df
 
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -125,6 +126,7 @@ def main():
     # save results
     args.output_dir.mkdir(exist_ok=True, parents=True)
     preds_df.to_csv(args.output_dir / "patient-preds.csv")
+
 
 if __name__ == "__main__":
     main()
