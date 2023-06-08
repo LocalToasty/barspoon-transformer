@@ -31,14 +31,21 @@ if __name__ == "__main__":
         required=True,
         help="Path containing the slide features as `h5` files",
     )
-    parser.add_argument(
+    targets_parser = parser.add_mutually_exclusive_group(required=True)
+    targets_parser.add_argument(
         "-t",
         "--target-label",
+        metavar="LABEL",
         type=str,
-        required=True,
         action="append",
         dest="target_labels",
         help="Target labels to train for. Can be specified multiple times",
+    )
+    targets_parser.add_argument(
+        "--target-file",
+        metavar="PATH",
+        type=Path,
+        help="A file containing a list of target labels, one per line.",
     )
     parser.add_argument(
         "--patient-col",
@@ -93,13 +100,6 @@ from torch.utils.data import DataLoader
 from data import BagDataset
 from model import LitEncDecTransformer
 from utils import generate_dataset_df
-
-
-def read_table(path: Path, dtype=str) -> pd.DataFrame:
-    if Path(path).suffix == ".csv":
-        return pd.read_csv(path, dtype=dtype)
-    else:
-        return pd.read_excel(path, dtype=dtype)
 
 
 if __name__ == "__main__":

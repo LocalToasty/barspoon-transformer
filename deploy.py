@@ -63,7 +63,6 @@ if __name__ == "__main__":
     parser.add_argument("--num-workers", type=int, default=min(os.cpu_count() or 0, 8))
     args = parser.parse_args()
 
-import numpy as np
 import pytorch_lightning as pl
 import torch
 from torch.utils.data import DataLoader
@@ -81,7 +80,7 @@ if __name__ == "__main__":
     )
     target_labels = model.hparams["target_labels"]
 
-    dataset_df = generate_dataset_df(
+    df = generate_dataset_df(
         clini_table=args.clini_table,
         slide_table=args.slide_table,
         feature_dir=args.feature_dir,
@@ -93,9 +92,7 @@ if __name__ == "__main__":
 
     # make a dataset with faux labels (the labels will be ignored)
     ds = BagDataset(
-        bags=list(dataset_df.path),
-        targets=torch.zeros(len(dataset_df), 0),
-        instances_per_bag=None,
+        bags=list(df.path), targets=torch.zeros(len(df), 0), instances_per_bag=None
     )
     dl = DataLoader(ds, shuffle=False, num_workers=args.num_workers)
 
@@ -106,7 +103,7 @@ if __name__ == "__main__":
     )
     predictions = torch.cat(trainer.predict(model=model, dataloaders=dl))  # type: ignore
 
-    preds_df = dataset_df.drop(columns="path")
+    preds_df = df.drop(columns="path")
     for target_label, preds in zip(target_labels, predictions.transpose(1, 0)):
         preds_df[f"{target_label}_0"] = 1 - preds
         preds_df[f"{target_label}_1"] = preds
@@ -116,19 +113,16 @@ if __name__ == "__main__":
     pos_weight = model.loss.pos_weight
 
     # all target labels for which we have clinical information
-    has_ground_truth = [t in dataset_df.columns for t in target_labels]
+    has_info = [t in df.columns for t in target_labels]
 
-    if any(has_ground_truth):
-        preds_df["loss"] = torch.nn.functional.binary_cross_entropy_with_logits(
-            input=predictions,
-            target=torch.tensor(
-                dataset_df[np.array(target_labels)[has_ground_truth]].values
-            ).type_as(predictions),
-            weight=weight[has_ground_truth] if weight is not None else None,
-            pos_weight=pos_weight[has_ground_truth] if pos_weight is not None else None,
-            reduction="none",
-        ).nanmean(dim=1)
-        preds_df = preds_df.sort_values(by="loss")
+    preds_df["loss"] = torch.nn.functional.binary_cross_entropy_with_logits(
+        predictions,
+        predictions,
+        weight=weight[has_info] if weight is not None else None,
+        pos_weight=pos_weight[has_info] if pos_weight is not None else None,
+        reduction="none",
+    ).nanmean(dim=1)
+    preds_df = preds_df.sort_values(by="loss")
 
     # save results
     args.output_dir.mkdir(exist_ok=True, parents=True)
