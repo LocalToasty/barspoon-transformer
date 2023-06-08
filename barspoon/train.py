@@ -120,15 +120,20 @@ def main():
         target_labels=target_labels,
     )
 
-    # TODO fail deadly
     target_labels = np.array(target_labels)
-    target_labels = target_labels[dataset_df[target_labels].nunique(dropna=True) == 2]
-    target_labels = (
+    label_count = dataset_df[target_labels].nunique(dropna=True)
+    assert (
+        label_count == 2
+    ).all(), f"the following labels have the wrong number of entries: {dict(label_count[label_count != 2])}"
+
+    numeric_labels = (
         dataset_df[target_labels]
         .select_dtypes(["int16", "int32", "int64", "float16", "float32", "float64"])
         .columns.values
     )
-    print(target_labels)
+    assert not (
+        non_numeric_labels := set(target_labels) - set(numeric_labels)
+    ), f"non-numeric labels: {non_numeric_labels}"
 
     targets = torch.tensor(
         dataset_df[target_labels].apply(pd.to_numeric).values, dtype=torch.float32
