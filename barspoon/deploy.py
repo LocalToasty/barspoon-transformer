@@ -26,19 +26,29 @@ def main():
         "-c",
         "--clini-table",
         metavar="PATH",
+        dest="clini_tables",
         type=Path,
-        help="Path to the clinical table",
+        action="append",
+        help="Path to the clinical table. Can be specified multiple times",
     )
     parser.add_argument(
-        "-s", "--slide-table", metavar="PATH", type=Path, help="Path to the slide table"
+        "-s",
+        "--slide-table",
+        metavar="PATH",
+        dest="slide_tables",
+        type=Path,
+        action="append",
+        help="Path to the slide table. Can be specified multiple times",
     )
     parser.add_argument(
         "-f",
         "--feature-dir",
         metavar="PATH",
+        dest="feature_dirs",
         type=Path,
         required=True,
-        help="Path containing the slide features as `h5` files",
+        action="append",
+        help="Path containing the slide features as `h5` files. Can be specified multiple times",
     )
     parser.add_argument(
         "-m",
@@ -52,14 +62,12 @@ def main():
         "--patient-col",
         metavar="COL",
         type=str,
-        default="PATIENT",
         help="Name of the patient column",
     )
     parser.add_argument(
         "--slide-col",
         metavar="COL",
         type=str,
-        default="FILENAME",
         help="Name of the slide column",
     )
     parser.add_argument(
@@ -79,10 +87,10 @@ def main():
     )
     target_labels = model.hparams["target_labels"]
 
-    df = generate_dataset_df(
-        clini_table=args.clini_table,
-        slide_table=args.slide_table,
-        feature_dir=args.feature_dir,
+    dataset_df = generate_dataset_df(
+        clini_tables=args.clini_tables,
+        slide_tables=args.slide_tables,
+        feature_dirs=args.feature_dirs,
         patient_col=args.patient_col,
         slide_col=args.slide_col,
         group_by=args.group_by,
@@ -91,7 +99,9 @@ def main():
 
     # make a dataset with faux labels (the labels will be ignored)
     ds = BagDataset(
-        bags=list(df.path), targets=torch.zeros(len(df), 0), instances_per_bag=None
+        bags=list(dataset_df.path),
+        targets=torch.zeros(len(dataset_df), 0),
+        instances_per_bag=None,
     )
     dl = DataLoader(ds, shuffle=False, num_workers=args.num_workers)
 
@@ -102,7 +112,7 @@ def main():
     )
     predictions = torch.cat(trainer.predict(model=model, dataloaders=dl))  # type: ignore
 
-    preds_df = df.drop(columns="path")
+    preds_df = dataset_df.drop(columns="path")
     for target_label, preds in zip(target_labels, predictions.transpose(1, 0)):
         preds_df[f"{target_label}_0"] = 1 - preds
         preds_df[f"{target_label}_1"] = preds
@@ -112,7 +122,7 @@ def main():
     pos_weight = model.loss.pos_weight
 
     # all target labels for which we have clinical information
-    has_info = [t in df.columns for t in target_labels]
+    has_info = [t in dataset_df.columns for t in target_labels]
 
     preds_df["loss"] = torch.nn.functional.binary_cross_entropy_with_logits(
         predictions,

@@ -28,24 +28,38 @@ def main():
         required=True,
         help="Directory path for the output",
     )
+
     parser.add_argument(
         "-c",
         "--clini-table",
         metavar="PATH",
+        dest="clini_tables",
         type=Path,
-        help="Path to the clinical table",
+        required=True,
+        action="append",
+        help="Path to the clinical table. Can be specified multiple times",
     )
     parser.add_argument(
-        "-s", "--slide-table", metavar="PATH", type=Path, help="Path to the slide table"
+        "-s",
+        "--slide-table",
+        metavar="PATH",
+        dest="slide_tables",
+        type=Path,
+        required=True,
+        action="append",
+        help="Path to the slide table. Can be specified multiple times",
     )
     parser.add_argument(
         "-f",
         "--feature-dir",
         metavar="PATH",
+        dest="feature_dirs",
         type=Path,
         required=True,
-        help="Path containing the slide features as `h5` files",
+        action="append",
+        help="Path containing the slide features as `h5` files. Can be specified multiple times",
     )
+
     targets_parser = parser.add_mutually_exclusive_group(required=True)
     targets_parser.add_argument(
         "-t",
@@ -62,18 +76,17 @@ def main():
         type=Path,
         help="A file containing a list of target labels, one per line.",
     )
+
     parser.add_argument(
         "--patient-col",
         metavar="COL",
         type=str,
-        default="PATIENT",
         help="Name of the patient column",
     )
     parser.add_argument(
         "--slide-col",
         metavar="COL",
         type=str,
-        default="FILENAME",
         help="Name of the slide column",
     )
     parser.add_argument(
@@ -82,6 +95,7 @@ def main():
         type=str,
         help="How to group slides. If 'clini' table is given, default is 'patient'; otherwise, default is 'slide'",
     )
+
     model_parser = parser.add_argument_group("model options")
     model_parser.add_argument("--num-encoder-heads", type=int, default=8)
     model_parser.add_argument("--num-decoder-heads", type=int, default=8)
@@ -89,6 +103,7 @@ def main():
     model_parser.add_argument("--num-decoder-layers", type=int, default=2)
     model_parser.add_argument("--d-model", type=int, default=512)
     model_parser.add_argument("--dim-feedforward", type=int, default=2048)
+
     training_parser = parser.add_argument_group("training options")
     training_parser.add_argument("--instances-per-bag", type=int, default=2**12)
     training_parser.add_argument("--learning-rate", type=float, default=1e-4)
@@ -111,9 +126,9 @@ def main():
             target_labels = [l.strip() for l in f if l]
 
     dataset_df = generate_dataset_df(
-        clini_table=args.clini_table,
-        slide_table=args.slide_table,
-        feature_dir=args.feature_dir,
+        clini_tables=args.clini_tables,
+        slide_tables=args.slide_tables,
+        feature_dirs=args.feature_dirs,
         patient_col=args.patient_col,
         slide_col=args.slide_col,
         group_by=args.group_by,
@@ -138,7 +153,6 @@ def main():
     targets = torch.tensor(
         dataset_df[target_labels].apply(pd.to_numeric).values, dtype=torch.float32
     )
-    bags = dataset_df.path.values
     pos_samples = targets.nansum(dim=0)
     neg_samples = (1 - targets).nansum(dim=0)
     pos_weight = neg_samples / pos_samples

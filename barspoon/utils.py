@@ -1,51 +1,58 @@
 from pathlib import Path
-from typing import Optional, Sequence, Union
+from typing import Iterable, Optional, Sequence, Union
 
 import pandas as pd
 
 
 def generate_dataset_df(
     *,
-    clini_table: Optional[Path] = None,
-    slide_table: Optional[Path] = None,
-    feature_dir: Path,
-    patient_col: str,
-    slide_col: str,
+    clini_tables: Iterable[Path] = [],
+    slide_tables: Iterable[Path] = [],
+    feature_dirs: Iterable[Path],
+    patient_col: Optional[str] = None,
+    slide_col: Optional[str] = None,
     group_by: Optional[str] = None,
     target_labels: Sequence[str],
 ) -> pd.DataFrame:
     # Create a table mapping slide names to their paths
-    h5s = list(feature_dir.glob("*.h5"))
-    assert h5s, f"no features found in {feature_dir}!"
-    h5_df = pd.DataFrame(h5s, columns=["path"])
+    h5s = {h5 for d in feature_dirs for h5 in d.glob("*.h5")}
+    assert h5s, f"no features found in {feature_dirs}!"
+    h5_df = pd.DataFrame(list(h5s), columns=["path"])
     h5_df["slide"] = h5_df.path.map(lambda p: p.stem)
     h5_df = h5_df.set_index("slide", verify_integrity=True)
     df = h5_df
 
-    if slide_table is not None:
-        slide_df = read_table(
-            slide_table,
-        )[
-            [patient_col, slide_col]
-        ].rename(columns={patient_col: "patient", slide_col: "slide"})
-        slide_df = slide_df.set_index("slide", verify_integrity=True)
+    if slide_tables:
+        slide_df = pd.concat([read_table(slide_table) for slide_table in slide_tables])
+        patient_col = patient_col or "PATIENT" if "PATIENT" in slide_df else "patient"
+        slide_col = slide_col or "FILENAME" if "FILENAME" in slide_df else "slide"
+        slide_df = slide_df[[patient_col, slide_col]].rename(
+            columns={patient_col: "patient", slide_col: "slide"}
+        )
+        slide_df = slide_df.drop_duplicates().set_index("slide", verify_integrity=True)
         df = df.join(slide_df, how="inner").reset_index()
 
-    if clini_table is not None:
+    if clini_tables:
         assert (
-            slide_table is not None
+            slide_tables
         ), "--slide-table has to be specified to associate clinical information with slides"
 
+        clini_df = pd.concat(
+            [
+                read_table(
+                    clini_table,
+                    dtype={patient_col: str},
+                )
+                for clini_table in clini_tables
+            ]
+        ).rename(columns={patient_col: "patient"})
+        # select all the relevant available ground truths,
+        # make sure there's no conflicting patient info
         clini_df = (
-            read_table(
-                clini_table,
-                dtype={patient_col: str},
-            )
-            .rename(columns={patient_col: "patient"})
+            clini_df[["patient", *list(set(target_labels) & set(clini_df.columns))]]
+            .drop_duplicates()
             .set_index("patient", verify_integrity=True)
         )
-        # select all the relevant available ground truths
-        clini_df = clini_df[list(set(target_labels) & set(clini_df.columns))]
         df = df.merge(clini_df.reset_index(), on="patient")
 
     # At this point we have a dataframe containing
