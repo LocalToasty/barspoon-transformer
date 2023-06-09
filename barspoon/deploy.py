@@ -9,11 +9,60 @@ from torch.utils.data import DataLoader
 
 from .data import BagDataset
 from .model import LitEncDecTransformer
-from .utils import generate_dataset_df
+from .utils import make_dataset_df, make_preds_df
 
 
 def main():
+    parser = make_argument_parser()
+    args = parser.parse_args()
+
+    pl.seed_everything(0)
+    torch.set_float32_matmul_precision("medium")
+
+    model = LitEncDecTransformer.load_from_checkpoint(
+        checkpoint_path=args.checkpoint_path
+    )
+    target_labels = model.hparams["target_labels"]
+
+    dataset_df = make_dataset_df(
+        clini_tables=args.clini_tables,
+        slide_tables=args.slide_tables,
+        feature_dirs=args.feature_dirs,
+        patient_col=args.patient_col,
+        slide_col=args.slide_col,
+        group_by=args.group_by,
+        target_labels=target_labels,
+    )
+
+    # make a dataset with faux labels (the labels will be ignored)
+    ds = BagDataset(
+        bags=list(dataset_df.path),
+        targets=torch.zeros(len(dataset_df), 0),
+        instances_per_bag=None,
+    )
+    dl = DataLoader(ds, shuffle=False, num_workers=args.num_workers)
+
+    trainer = pl.Trainer(
+        default_root_dir=args.output_dir,
+        accelerator="auto",
+        devices=1,
+    )
+    predictions = torch.cat(trainer.predict(model=model, dataloaders=dl))  # type: ignore
+    preds_df = make_preds_df(
+        predictions=predictions,
+        base_df=dataset_df.drop(columns="path"),
+        target_labels=target_labels,
+        loss=model.loss,
+    )
+
+    # save results
+    args.output_dir.mkdir(exist_ok=True, parents=True)
+    preds_df.to_csv(args.output_dir / "patient-preds.csv")
+
+
+def make_argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
+
     parser.add_argument(
         "-o",
         "--output-dir",
@@ -22,6 +71,7 @@ def main():
         required=True,
         help="Directory path for the output",
     )
+
     parser.add_argument(
         "-c",
         "--clini-table",
@@ -50,6 +100,7 @@ def main():
         action="append",
         help="Path containing the slide features as `h5` files. Can be specified multiple times",
     )
+
     parser.add_argument(
         "-m",
         "--checkpoint-path",
@@ -58,6 +109,7 @@ def main():
         required=True,
         help="Path to the checkpoint file",
     )
+
     parser.add_argument(
         "--patient-col",
         metavar="COL",
@@ -70,72 +122,17 @@ def main():
         type=str,
         help="Name of the slide column",
     )
+
     parser.add_argument(
         "--group-by",
         metavar="COL",
         type=str,
         help="How to group slides. If 'clini' table is given, default is 'patient'; otherwise, default is 'slide'",
     )
+
     parser.add_argument("--num-workers", type=int, default=min(os.cpu_count() or 0, 8))
-    args = parser.parse_args()
 
-    pl.seed_everything(0)
-    torch.set_float32_matmul_precision("medium")
-
-    model = LitEncDecTransformer.load_from_checkpoint(
-        checkpoint_path=args.checkpoint_path
-    )
-    target_labels = model.hparams["target_labels"]
-
-    dataset_df = generate_dataset_df(
-        clini_tables=args.clini_tables,
-        slide_tables=args.slide_tables,
-        feature_dirs=args.feature_dirs,
-        patient_col=args.patient_col,
-        slide_col=args.slide_col,
-        group_by=args.group_by,
-        target_labels=target_labels,
-    )
-
-    # make a dataset with faux labels (the labels will be ignored)
-    ds = BagDataset(
-        bags=list(dataset_df.path),
-        targets=torch.zeros(len(dataset_df), 0),
-        instances_per_bag=None,
-    )
-    dl = DataLoader(ds, shuffle=False, num_workers=args.num_workers)
-
-    trainer = pl.Trainer(
-        default_root_dir=args.output_dir,
-        accelerator="auto",
-        devices=1,
-    )
-    predictions = torch.cat(trainer.predict(model=model, dataloaders=dl))  # type: ignore
-
-    preds_df = dataset_df.drop(columns="path")
-    for target_label, preds in zip(target_labels, predictions.transpose(1, 0)):
-        preds_df[f"{target_label}_0"] = 1 - preds
-        preds_df[f"{target_label}_1"] = preds
-
-    # calculate the element-wise loss
-    weight = model.loss.weight
-    pos_weight = model.loss.pos_weight
-
-    # all target labels for which we have clinical information
-    has_info = [t in dataset_df.columns for t in target_labels]
-
-    preds_df["loss"] = torch.nn.functional.binary_cross_entropy_with_logits(
-        predictions,
-        predictions,
-        weight=weight[has_info] if weight is not None else None,
-        pos_weight=pos_weight[has_info] if pos_weight is not None else None,
-        reduction="none",
-    ).nanmean(dim=1)
-    preds_df = preds_df.sort_values(by="loss")
-
-    # save results
-    args.output_dir.mkdir(exist_ok=True, parents=True)
-    preds_df.to_csv(args.output_dir / "patient-preds.csv")
+    return parser
 
 
 if __name__ == "__main__":

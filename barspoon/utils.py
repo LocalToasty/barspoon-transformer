@@ -2,9 +2,12 @@ from pathlib import Path
 from typing import Iterable, Optional, Sequence, Union
 
 import pandas as pd
+import torch
+
+from .model import FilteredBCEWithLogitsLoss
 
 
-def generate_dataset_df(
+def make_dataset_df(
     *,
     clini_tables: Iterable[Path] = [],
     slide_tables: Iterable[Path] = [],
@@ -76,7 +79,50 @@ def generate_dataset_df(
 def read_table(table: Union[Path, pd.DataFrame], dtype=str) -> pd.DataFrame:
     if isinstance(table, pd.DataFrame):
         return table
+
     if table.suffix == ".csv":
-        return pd.read_csv(table, dtype=dtype, low_memory=False)
+        return pd.read_csv(table, dtype=dtype, low_memory=False)  # type: ignore
     else:
-        return pd.read_excel(table, dtype=dtype, low_memory=False)
+        return pd.read_excel(table, dtype=dtype, low_memory=False)  # type: ignore
+
+
+def make_preds_df(
+    predictions: torch.Tensor,
+    base_df: pd.DataFrame,
+    target_labels: Sequence[str],
+    loss: FilteredBCEWithLogitsLoss,
+) -> pd.DataFrame:
+    preds_df = pd.concat(
+        [
+            base_df[target_labels],
+            *[
+                pd.DataFrame(
+                    {f"{target_label}_1": score, f"{target_label}_0": 1 - score},
+                    index=base_df.index,
+                )
+                for target_label, score in zip(
+                    target_labels, predictions.transpose(1, 0)
+                )
+            ],
+        ],
+        axis=1,
+    ).copy()
+
+    # all target labels for which we have clinical information
+    has_info = [t in base_df.columns for t in target_labels]
+
+    # calculate the element-wise loss
+    weight = loss.weight
+    pos_weight = loss.pos_weight
+
+    preds_df["loss"] = torch.nn.functional.binary_cross_entropy_with_logits(
+        input=predictions[:, has_info],
+        target=torch.tensor(preds_df[target_labels].values),
+        weight=weight[has_info] if weight is not None else None,
+        pos_weight=pos_weight[has_info] if pos_weight is not None else None,
+        reduction="none",
+    ).nanmean(dim=1)
+
+    preds_df = preds_df.sort_values(by="loss")
+
+    return preds_df

@@ -3,8 +3,10 @@ import argparse
 import os
 import shutil
 from pathlib import Path
+from typing import Iterable, Sequence, Tuple
 
 import numpy as np
+import numpy.typing as npt
 import pandas as pd
 import pytorch_lightning as pl
 import torch
@@ -15,10 +17,112 @@ from torch.utils.data import DataLoader
 
 from .data import BagDataset
 from .model import LitEncDecTransformer
-from .utils import generate_dataset_df
+from .utils import make_dataset_df, make_preds_df
 
 
 def main():
+    parser = make_argument_parser()
+    args = parser.parse_args()
+
+    if (args.output_dir / "done").exists():
+        # already done...
+        return
+    elif args.output_dir.exists():
+        # previous attempt didn't finish; start over
+        shutil.rmtree(args.output_dir)
+
+    pl.seed_everything(0)
+    torch.set_float32_matmul_precision("medium")
+
+    # read target labels from file, if need be
+    if args.target_labels:
+        target_labels = args.target_labels
+    else:
+        with open(args.target_file) as f:
+            target_labels = [l.strip() for l in f if l]
+
+    dataset_df = make_dataset_df(
+        clini_tables=args.clini_tables,
+        slide_tables=args.slide_tables,
+        feature_dirs=args.feature_dirs,
+        patient_col=args.patient_col,
+        slide_col=args.slide_col,
+        group_by=args.group_by,
+        target_labels=target_labels,
+    )
+
+    # see if target labels are good, otherwise die a fiery death
+    target_labels = np.array(target_labels)
+    assert_targets_are_sane(dataset_df=dataset_df, target_labels=target_labels)
+
+    pos_weight = get_pos_weight(
+        torch.tensor(
+            dataset_df[target_labels].apply(pd.to_numeric).values, dtype=torch.float32
+        )
+    )
+
+    train_items, valid_items = train_test_split(dataset_df.index, test_size=0.2)
+    train_df = dataset_df.loc[train_items]
+    valid_df = dataset_df.loc[valid_items]
+
+    train_dl, valid_dl = make_dataloaders(
+        train_bags=train_df.path.values,
+        train_targets=torch.tensor(train_df[target_labels].apply(pd.to_numeric).values),  # type: ignore
+        valid_bags=valid_df.path.values,
+        valid_targets=torch.tensor(valid_df[target_labels].apply(pd.to_numeric).values),  # type: ignore
+        instances_per_bag=args.instances_per_bag,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+    )
+
+    example_bags, _ = next(iter(train_dl))
+    d_features = example_bags.size(-1)
+
+    model = LitEncDecTransformer(
+        d_features=d_features,
+        target_labels=target_labels,
+        pos_weight=pos_weight,
+        # other hparams
+        training_set=list(train_items),
+        validation_set=list(valid_items),
+        **{k: v for k, v in vars(args).items() if k not in {"target_labels"}},
+    )
+
+    trainer = pl.Trainer(
+        default_root_dir=args.output_dir,
+        callbacks=[
+            EarlyStopping(
+                monitor="val_TopKMultilabelAUROC", mode="max", patience=args.patience
+            ),
+            ModelCheckpoint(
+                monitor="val_TopKMultilabelAUROC",
+                mode="max",
+                filename="checkpoint-{epoch:02d}-{val_TopKMultilabelAUROC:0.3f}",
+            ),
+        ],
+        max_epochs=args.max_epochs,
+        accelerator="auto",
+        accumulate_grad_batches=args.accumulate_grad_samples // args.batch_size,
+        gradient_clip_val=0.5,
+        logger=CSVLogger(save_dir=args.output_dir),
+    )
+
+    trainer.fit(model=model, train_dataloaders=train_dl, val_dataloaders=valid_dl)
+
+    predictions = torch.cat(trainer.predict(model=model, dataloaders=valid_dl, return_predictions=True))  # type: ignore
+    preds_df = make_preds_df(
+        predictions=predictions,
+        base_df=valid_df,
+        target_labels=target_labels,
+        loss=model.loss,
+    )
+    preds_df.to_csv(args.output_dir / "valid-patient-preds.csv")
+
+    with open(args.output_dir / "done", "w"):
+        pass
+
+
+def make_argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "-o",
@@ -114,28 +218,13 @@ def main():
     )
     training_parser.add_argument("--patience", type=int, default=16)
     training_parser.add_argument("--max-epochs", type=int, default=256)
-    args = parser.parse_args()
 
-    pl.seed_everything(0)
-    torch.set_float32_matmul_precision("medium")
+    return parser
 
-    if args.target_labels:
-        target_labels = args.target_labels
-    else:
-        with open(args.target_file) as f:
-            target_labels = [l.strip() for l in f if l]
 
-    dataset_df = generate_dataset_df(
-        clini_tables=args.clini_tables,
-        slide_tables=args.slide_tables,
-        feature_dirs=args.feature_dirs,
-        patient_col=args.patient_col,
-        slide_col=args.slide_col,
-        group_by=args.group_by,
-        target_labels=target_labels,
-    )
-
-    target_labels = np.array(target_labels)
+def assert_targets_are_sane(
+    dataset_df: pd.DataFrame, target_labels: npt.NDArray[np.str_]
+) -> None:
     label_count = dataset_df[target_labels].nunique(dropna=True)
     assert (
         label_count == 2
@@ -150,106 +239,43 @@ def main():
         non_numeric_labels := set(target_labels) - set(numeric_labels)
     ), f"non-numeric labels: {non_numeric_labels}"
 
-    targets = torch.tensor(
-        dataset_df[target_labels].apply(pd.to_numeric).values, dtype=torch.float32
-    )
+
+def get_pos_weight(targets: torch.Tensor) -> torch.Tensor:
     pos_samples = targets.nansum(dim=0)
     neg_samples = (1 - targets).nansum(dim=0)
     pos_weight = neg_samples / pos_samples
+    return pos_weight
 
-    train_items, valid_items = train_test_split(dataset_df.index, test_size=0.2)
 
-    if (args.output_dir / "done").exists():
-        # already done...
-        exit(0)
-    elif args.output_dir.exists():
-        # previous attempt didn't finish; start over
-        shutil.rmtree(args.output_dir)
-
+def make_dataloaders(
+    *,
+    train_bags: Sequence[Iterable[Path]],
+    train_targets: torch.Tensor,
+    valid_bags: Sequence[Iterable[Path]],
+    valid_targets: torch.Tensor,
+    batch_size: int,
+    instances_per_bag: int,
+    num_workers: int,
+) -> Tuple[DataLoader, DataLoader]:
     train_ds = BagDataset(
-        bags=dataset_df.path.loc[train_items].values,
-        targets=torch.tensor(dataset_df.loc[train_items, target_labels].apply(pd.to_numeric).values),  # type: ignore
-        instances_per_bag=args.instances_per_bag,
+        bags=train_bags,
+        targets=train_targets,
+        instances_per_bag=instances_per_bag,
         deterministic=False,
     )
     train_dl = DataLoader(
-        train_ds, batch_size=args.batch_size, num_workers=args.num_workers, shuffle=True
+        train_ds, batch_size=batch_size, num_workers=num_workers, shuffle=True
     )
 
     valid_ds = BagDataset(
-        bags=dataset_df.path.loc[valid_items].values,
-        targets=torch.tensor(dataset_df.loc[valid_items, target_labels].apply(pd.to_numeric).values),  # type: ignore
-        instances_per_bag=args.instances_per_bag,
+        bags=valid_bags,
+        targets=valid_targets,
+        instances_per_bag=instances_per_bag,
         deterministic=True,
     )
-    valid_dl = DataLoader(
-        valid_ds, batch_size=args.batch_size, num_workers=args.num_workers
-    )
+    valid_dl = DataLoader(valid_ds, batch_size=batch_size, num_workers=num_workers)
 
-    example_bags, _ = next(iter(train_dl))
-    d_features = example_bags.size(-1)
-
-    model = LitEncDecTransformer(
-        d_features=d_features,
-        target_labels=target_labels,
-        pos_weight=pos_weight,
-        # other hparams
-        training_set=list(train_items),
-        validation_set=list(valid_items),
-        **{k: v for k, v in vars(args).items() if k not in {"target_labels"}},
-    )
-
-    trainer = pl.Trainer(
-        default_root_dir=args.output_dir,
-        callbacks=[
-            EarlyStopping(
-                monitor="val_TopKMultilabelAUROC", mode="max", patience=args.patience
-            ),
-            ModelCheckpoint(
-                monitor="val_TopKMultilabelAUROC",
-                mode="max",
-                filename="checkpoint-{epoch:02d}-{val_TopKMultilabelAUROC:0.3f}",
-            ),
-        ],
-        max_epochs=args.max_epochs,
-        accelerator="auto",
-        accumulate_grad_batches=args.accumulate_grad_samples // args.batch_size,
-        gradient_clip_val=0.5,
-        logger=CSVLogger(save_dir=args.output_dir),
-    )
-
-    trainer.fit(model=model, train_dataloaders=train_dl, val_dataloaders=valid_dl)
-
-    # TODO factor out
-    predictions = torch.cat(trainer.predict(model=model, dataloaders=valid_dl, return_predictions=True))  # type: ignore
-    preds_df = pd.concat(
-        [
-            dataset_df.loc[valid_items, target_labels],  # type: ignore
-            *[
-                pd.DataFrame(
-                    {f"{target_label}_1": score, f"{target_label}_0": 1 - score},
-                    index=valid_items,
-                )
-                for target_label, score in zip(
-                    target_labels, predictions.transpose(1, 0)
-                )
-            ],
-        ],
-        axis=1,
-    ).copy()
-    preds_df["loss"] = torch.nn.functional.binary_cross_entropy_with_logits(
-        predictions,
-        predictions,
-        weight=model.loss.weight,
-        pos_weight=model.loss.pos_weight,
-        reduction="none",
-    ).nanmean(dim=1)
-    preds_df = preds_df.sort_values(by="loss")
-
-    preds_df.to_csv(args.output_dir / "valid-patient-preds.csv")
-
-    with open(args.output_dir / "done", "w"):
-        pass
+    return train_dl, valid_dl
 
 
 if __name__ == "__main__":
