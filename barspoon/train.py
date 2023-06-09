@@ -24,13 +24,6 @@ def main():
     parser = make_argument_parser()
     args = parser.parse_args()
 
-    if (args.output_dir / "done").exists():
-        # already done...
-        return
-    elif args.output_dir.exists():
-        # previous attempt didn't finish; start over
-        shutil.rmtree(args.output_dir)
-
     pl.seed_everything(0)
     torch.set_float32_matmul_precision("medium")
 
@@ -117,9 +110,6 @@ def main():
         loss=model.loss,
     )
     preds_df.to_csv(args.output_dir / "valid-patient-preds.csv")
-
-    with open(args.output_dir / "done", "w"):
-        pass
 
 
 def make_argument_parser() -> argparse.ArgumentParser:
