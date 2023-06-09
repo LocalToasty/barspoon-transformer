@@ -54,9 +54,25 @@ def main():
         )
     )
 
-    train_items, valid_items = train_test_split(dataset_df.index, test_size=0.2)
-    train_df = dataset_df.loc[train_items]
-    valid_df = dataset_df.loc[valid_items]
+    if args.valid_clini_tables or args.valid_slide_tables or args.valid_feature_dirs:
+        train_df = dataset_df
+        valid_df = make_dataset_df(
+            clini_tables=args.valid_clini_tables or args.clini_tables,
+            slide_tables=args.valid_slide_tables or args.slide_tables,
+            feature_dirs=args.valid_feature_dirs or args.feature_dirs,
+            patient_col=args.patient_col,
+            slide_col=args.slide_col,
+            group_by=args.group_by,
+            target_labels=target_labels,
+        )
+    else:
+        train_items, valid_items = train_test_split(dataset_df.index, test_size=0.2)
+        train_df = dataset_df.loc[train_items]
+        valid_df = dataset_df.loc[valid_items]
+
+    assert not (
+        overlap := set(train_df.index) & set(valid_df.index)
+    ), f"overlap between training and testing set: {overlap}"
 
     train_dl, valid_dl = make_dataloaders(
         train_bags=train_df.path.values,
@@ -76,8 +92,10 @@ def main():
         target_labels=target_labels,
         pos_weight=pos_weight,
         # other hparams
-        training_set=list(train_items),
-        validation_set=list(valid_items),
+        **{
+            f"train_{train_df.index.name}": list(train_df.index),
+            f"valid_{valid_df.index.name}": list(valid_df.index),
+        },
         **{k: v for k, v in vars(args).items() if k not in {"target_labels"}},
     )
 
@@ -152,6 +170,32 @@ def make_argument_parser() -> argparse.ArgumentParser:
         required=True,
         action="append",
         help="Path containing the slide features as `h5` files. Can be specified multiple times",
+    )
+
+    valid_cohort_parser = parser.add_argument_group(title="optional validation cohort")
+    valid_cohort_parser.add_argument(
+        "--valid-clini-table",
+        metavar="PATH",
+        dest="valid_clini_tables",
+        type=Path,
+        action="append",
+        help="Path to the clinical table of the validation set. Can be specified multiple times",
+    )
+    valid_cohort_parser.add_argument(
+        "--valid-slide-table",
+        metavar="PATH",
+        dest="valid_slide_tables",
+        type=Path,
+        action="append",
+        help="Path to the slide table of the validation set. Can be specified multiple times",
+    )
+    valid_cohort_parser.add_argument(
+        "--valid-feature-dir",
+        metavar="PATH",
+        dest="valid_feature_dirs",
+        type=Path,
+        action="append",
+        help="Path containing the slide features of the validation set as `h5` files. Can be specified multiple times",
     )
 
     targets_parser = parser.add_mutually_exclusive_group(required=True)
