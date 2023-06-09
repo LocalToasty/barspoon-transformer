@@ -34,28 +34,16 @@ def main():
         with open(args.target_file) as f:
             target_labels = [l.strip() for l in f if l]
 
-    dataset_df = make_dataset_df(
-        clini_tables=args.clini_tables,
-        slide_tables=args.slide_tables,
-        feature_dirs=args.feature_dirs,
-        patient_col=args.patient_col,
-        slide_col=args.slide_col,
-        group_by=args.group_by,
-        target_labels=target_labels,
-    )
-
-    # see if target labels are good, otherwise die a fiery death
-    target_labels = np.array(target_labels)
-    assert_targets_are_sane(dataset_df=dataset_df, target_labels=target_labels)
-
-    pos_weight = get_pos_weight(
-        torch.tensor(
-            dataset_df[target_labels].apply(pd.to_numeric).values, dtype=torch.float32
-        )
-    )
-
     if args.valid_clini_tables or args.valid_slide_tables or args.valid_feature_dirs:
-        train_df = dataset_df
+        train_df = make_dataset_df(
+            clini_tables=args.clini_tables,
+            slide_tables=args.slide_tables,
+            feature_dirs=args.feature_dirs,
+            patient_col=args.patient_col,
+            slide_col=args.slide_col,
+            group_by=args.group_by,
+            target_labels=target_labels,
+        )
         valid_df = make_dataset_df(
             clini_tables=args.valid_clini_tables or args.clini_tables,
             slide_tables=args.valid_slide_tables or args.slide_tables,
@@ -66,9 +54,27 @@ def main():
             target_labels=target_labels,
         )
     else:
+        dataset_df = make_dataset_df(
+            clini_tables=args.clini_tables,
+            slide_tables=args.slide_tables,
+            feature_dirs=args.feature_dirs,
+            patient_col=args.patient_col,
+            slide_col=args.slide_col,
+            group_by=args.group_by,
+            target_labels=target_labels,
+        )
         train_items, valid_items = train_test_split(dataset_df.index, test_size=0.2)
-        train_df = dataset_df.loc[train_items]
-        valid_df = dataset_df.loc[valid_items]
+        train_df, valid_df = dataset_df.loc[train_items], dataset_df.loc[valid_items]
+
+    # see if target labels are good, otherwise die a fiery death
+    target_labels = np.array(target_labels)
+    assert_targets_are_sane(train_df=train_df, target_labels=target_labels)
+
+    pos_weight = get_pos_weight(
+        torch.tensor(
+            train_df[target_labels].apply(pd.to_numeric).values, dtype=torch.float32
+        )
+    )
 
     assert not (
         overlap := set(train_df.index) & set(valid_df.index)
@@ -257,15 +263,15 @@ def make_argument_parser() -> argparse.ArgumentParser:
 
 
 def assert_targets_are_sane(
-    dataset_df: pd.DataFrame, target_labels: npt.NDArray[np.str_]
+    train_df: pd.DataFrame, target_labels: npt.NDArray[np.str_]
 ) -> None:
-    label_count = dataset_df[target_labels].nunique(dropna=True)
+    label_count = train_df[target_labels].nunique(dropna=True)
     assert (
         label_count == 2
     ).all(), f"the following labels have the wrong number of entries: {dict(label_count[label_count != 2])}"
 
     numeric_labels = (
-        dataset_df[target_labels]
+        train_df[target_labels]
         .select_dtypes(["int16", "int32", "int64", "float16", "float32", "float64"])
         .columns.values
     )
