@@ -34,6 +34,7 @@ def make_dataset_df(
         )
         slide_df = slide_df.drop_duplicates().set_index("slide", verify_integrity=True)
         df = df.join(slide_df, how="inner").reset_index()
+        assert not df.empty, "no match between features and slide table"
 
     if clini_tables:
         assert (
@@ -57,6 +58,7 @@ def make_dataset_df(
             .set_index("patient", verify_integrity=True)
         )
         df = df.merge(clini_df.reset_index(), on="patient")
+        assert not df.empty, "no match between slides and clini table"
 
     # At this point we have a dataframe containing
     # - h5 paths
