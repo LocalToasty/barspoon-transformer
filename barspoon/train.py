@@ -69,7 +69,7 @@ def main():
     # see if target labels are good, otherwise die a fiery death
     target_labels = filter_targets(
         train_df=train_df,
-        target_labels=target_labels,
+        target_labels=np.array(target_labels),
         mode="warn" if args.filter_targets else "raise",
     )
 
@@ -132,9 +132,10 @@ def main():
     predictions = torch.cat(trainer.predict(model=model, dataloaders=valid_dl, return_predictions=True))  # type: ignore
     preds_df = make_preds_df(
         predictions=predictions,
+        weight=None,  # TODO
+        pos_weight=model.pos_weight,
         base_df=valid_df,
         target_labels=target_labels,
-        loss=model.loss,
     )
     preds_df.to_csv(args.output_dir / "valid-patient-preds.csv")
 
@@ -272,10 +273,10 @@ def make_argument_parser() -> argparse.ArgumentParser:
 
 def filter_targets(
     train_df: pd.DataFrame,
-    target_labels: Sequence[str],
+    target_labels: npt.NDArray[np.str_],
     mode: Literal["raise", "warn", "ignore"] = "warn",
 ) -> npt.NDArray[np.str_]:
-    label_count = train_df[target_labels].nunique(dropna=True)
+    label_count: pd.Series = train_df[target_labels].nunique(dropna=True)  # type: ignore
     if (label_count != 2).any():
         note_problem(
             f"the following labels have the wrong number of entries: {dict(label_count[label_count != 2])}",
@@ -294,7 +295,7 @@ def filter_targets(
 
     target_labels = numeric_labels
 
-    return target_labels
+    return np.array(target_labels)
 
 
 def note_problem(msg, mode: Literal["raise", "warn", "ignore"]):

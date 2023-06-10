@@ -171,15 +171,25 @@ class LitMilClassificationMixin(pl.LightningModule):
             )
 
         self.target_labels = target_labels
-        self.loss = FilteredBCEWithLogitsLoss(pos_weight=pos_weight)
+        self.pos_weight = pos_weight
+        # self.register_buffer("weight", torch.ones(len(target_labels)))
 
         self.save_hyperparameters()
 
     def step(self, batch: Tuple[Tensor, Tensor], step_name=None):
         bags, targets = batch
         logits = self(bags)
+
         # BCE ignoring the positions we don't have target labels for
-        loss = self.loss(logits, targets.type_as(logits))
+        loss = F.binary_cross_entropy_with_logits(
+            input=logits.where(~targets.isnan(), 0),
+            target=targets.where(~targets.isnan(), 0),
+            # weight=self.weight,
+            pos_weight=self.pos_weight.type_as(logits)
+            if self.pos_weight is not None
+            else None,
+        )
+
         if step_name:
             # update global metrics
             global_metrics = getattr(self, f"{step_name}_global_metrics")
@@ -318,46 +328,3 @@ class LitEncDecTransformer(LitMilClassificationMixin):
 
     def forward(self, tile_tokens):
         return self.model(tile_tokens)
-
-
-class FilteredBCEWithLogitsLoss(nn.Module):
-    def __init__(
-        self,
-        weight: Optional[Tensor] = None,
-        pos_weight: Optional[Tensor] = None,
-        reduction: str = "mean",
-    ) -> None:
-        super().__init__()
-        self.register_buffer("weight", weight)
-        self.register_buffer("pos_weight", pos_weight)
-        self.weight: Optional[Tensor]
-        self.pos_weight: Optional[Tensor]
-        self.reduction = reduction
-
-    def forward(self, input: Tensor, target: Tensor) -> Tensor:
-        loss = F.binary_cross_entropy_with_logits(
-            input,
-            target,
-            self.weight,
-            pos_weight=self.pos_weight,
-            reduction="none",
-        )
-
-        if self.reduction == "none":
-            return loss
-        elif self.reduction == "sum":
-            return loss.nansum()
-        elif self.reduction == "mean":
-            return loss.nansum() / target.size(-1)
-        else:
-            raise ValueError("unknown reduction method", self.reduction)
-
-    def extra_repr(self) -> str:
-        parts = []
-        if self.weight is not None:
-            parts.append(f"weight={self.weight}")
-        if self.pos_weight is not None:
-            parts.append(f"pos_weight={self.pos_weight}")
-        if self.reduction is not None:
-            parts.append(f"reduction={self.reduction}")
-        return ", ".join(parts)

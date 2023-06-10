@@ -4,8 +4,6 @@ from typing import Iterable, Optional, Sequence, Union
 import pandas as pd
 import torch
 
-from .model import FilteredBCEWithLogitsLoss
-
 
 def make_dataset_df(
     *,
@@ -90,9 +88,10 @@ def read_table(table: Union[Path, pd.DataFrame], dtype=str) -> pd.DataFrame:
 
 def make_preds_df(
     predictions: torch.Tensor,
+    weight: Optional[torch.Tensor],
+    pos_weight: Optional[torch.Tensor],
     base_df: pd.DataFrame,
     target_labels: Sequence[str],
-    loss: FilteredBCEWithLogitsLoss,
 ) -> pd.DataFrame:
     preds_df = pd.concat(
         [
@@ -111,17 +110,16 @@ def make_preds_df(
     ).copy()
 
     # all target labels for which we have clinical information
-    has_info = [t in base_df.columns for t in target_labels]
+    has_ground_truth = [t in base_df.columns for t in target_labels]
 
+    ys = predictions[:, has_ground_truth]
+    ts = torch.tensor(preds_df[target_labels].values)
     # calculate the element-wise loss
-    weight = loss.weight
-    pos_weight = loss.pos_weight
-
     preds_df["loss"] = torch.nn.functional.binary_cross_entropy_with_logits(
-        input=predictions[:, has_info],
-        target=torch.tensor(preds_df[target_labels].values),
-        weight=weight[has_info] if weight is not None else None,
-        pos_weight=pos_weight[has_info] if pos_weight is not None else None,
+        input=ys.where(~ts.isnan(), 0),
+        target=ts.where(~ts.isnan(), 0),
+        weight=weight[has_ground_truth] if weight is not None else None,
+        pos_weight=pos_weight[has_ground_truth] if pos_weight is not None else None,
         reduction="none",
     ).nanmean(dim=1)
 
