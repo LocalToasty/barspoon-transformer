@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 import argparse
+import logging
 import os
-import shutil
 from pathlib import Path
-from typing import Iterable, Sequence, Tuple
+from typing import Iterable, Literal, Sequence, Tuple
 
 import numpy as np
 import numpy.typing as npt
@@ -67,8 +67,11 @@ def main():
         train_df, valid_df = dataset_df.loc[train_items], dataset_df.loc[valid_items]
 
     # see if target labels are good, otherwise die a fiery death
-    target_labels = np.array(target_labels)
-    assert_targets_are_sane(train_df=train_df, target_labels=target_labels)
+    target_labels = filter_targets(
+        train_df=train_df,
+        target_labels=target_labels,
+        mode="warn" if args.filter_targets else "raise",
+    )
 
     pos_weight = get_pos_weight(
         torch.tensor(
@@ -220,6 +223,11 @@ def make_argument_parser() -> argparse.ArgumentParser:
         type=Path,
         help="A file containing a list of target labels, one per line.",
     )
+    parser.add_argument(
+        "--filter-targets",
+        action="store_true",
+        help="Automatically filter out nonsensical targets",
+    )
 
     parser.add_argument(
         "--patient-col",
@@ -262,22 +270,42 @@ def make_argument_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def assert_targets_are_sane(
-    train_df: pd.DataFrame, target_labels: npt.NDArray[np.str_]
-) -> None:
+def filter_targets(
+    train_df: pd.DataFrame,
+    target_labels: Sequence[str],
+    mode: Literal["raise", "warn", "ignore"] = "warn",
+) -> npt.NDArray[np.str_]:
     label_count = train_df[target_labels].nunique(dropna=True)
-    assert (
-        label_count == 2
-    ).all(), f"the following labels have the wrong number of entries: {dict(label_count[label_count != 2])}"
+    if (label_count != 2).any():
+        note_problem(
+            f"the following labels have the wrong number of entries: {dict(label_count[label_count != 2])}",
+            mode=mode,
+        )
+
+    target_labels = np.array(label_count.index)[label_count == 2]
 
     numeric_labels = (
         train_df[target_labels]
         .select_dtypes(["int16", "int32", "int64", "float16", "float32", "float64"])
         .columns.values
     )
-    assert not (
-        non_numeric_labels := set(target_labels) - set(numeric_labels)
-    ), f"non-numeric labels: {non_numeric_labels}"
+    if non_numeric_labels := set(target_labels) - set(numeric_labels):
+        note_problem(f"non-numeric labels: {non_numeric_labels}", mode=mode)
+
+    target_labels = numeric_labels
+
+    return target_labels
+
+
+def note_problem(msg, mode: Literal["raise", "warn", "ignore"]):
+    if mode == "raise":
+        raise RuntimeError(msg)
+    elif mode == "warn":
+        logging.warning(msg)
+    elif mode == "ignore":
+        return
+    else:
+        raise ValueError("unknown error propagation type", mode)
 
 
 def get_pos_weight(targets: torch.Tensor) -> torch.Tensor:
