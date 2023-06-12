@@ -9,6 +9,21 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, Optional, Tuple
 from sklearn.preprocessing import LabelEncoder
+from sklearn.model_selection import KFold
+import h5py
+import numpy as np
+import pandas as pd
+import pytorch_lightning as pl
+import torch
+from os.path import exists
+import torch.nn.functional as F
+import torchmetrics
+from pytorch_lightning.callbacks import EarlyStopping, ModelCheckpoint
+from pytorch_lightning.loggers import CSVLogger
+from torch import nn
+from torch.utils.data import DataLoader, Dataset
+from torchmetrics.functional.classification.auroc import _multilabel_auroc_compute
+from torchmetrics.utilities.data import dim_zero_cat, select_topk
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -20,26 +35,13 @@ if __name__ == "__main__":
     parser.add_argument("--num-heads", type=int, default=8)
     parser.add_argument("--num-encoder-heads", type=int, default=8)
     parser.add_argument("--num-decoder-heads", type=int, default=8)
-    parser.add_argument("--num-layers", type=int, default=4)
+    parser.add_argument("--num-layers", type=int, default=2)
     parser.add_argument("--d-model", type=int, default=512)
     parser.add_argument("--dim-feedforward", type=int, default=2048)
     parser.add_argument("--instances-per-bag", type=int, default=2**11)
     parser.add_argument("--learning-rate", type=float, default=1e-4)
+    parser.add_argument("--zoom", action='store_true',default=False)
     args = parser.parse_args()
-
-import h5py
-import numpy as np
-import pandas as pd
-import pytorch_lightning as pl
-import torch
-import torch.nn.functional as F
-import torchmetrics
-from pytorch_lightning.callbacks import EarlyStopping, ModelCheckpoint
-from pytorch_lightning.loggers import CSVLogger
-from torch import nn
-from torch.utils.data import DataLoader, Dataset
-from torchmetrics.functional.classification.auroc import _multilabel_auroc_compute
-from torchmetrics.utilities.data import dim_zero_cat, select_topk
 
 
 class ParallelLinear(nn.Module):
@@ -91,13 +93,16 @@ class BagDataset(Dataset):
     labels: torch.Tensor
     instances_per_bag: int
     deterministic: bool
+    zoom: bool
 
     def __len__(self):
         return len(self.bags)
 
-    def __getitem__(self, index: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    def __getitem__(self, index: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
         # collect all the features
         feat_list = []
+        coord_list = []
+        zoom_list = []
         for bag_file in self.bags[index]:
             with h5py.File(bag_file, "r") as f:
                 feat_list.append(
@@ -105,13 +110,51 @@ class BagDataset(Dataset):
                         torch.from_numpy(f["feats"][:]),
                         n=self.instances_per_bag,
                         deterministic=self.deterministic,
+                    ) 
+                ) if self.instances_per_bag else feat_list.append(torch.from_numpy(f["feats"][:]))
+                coord_list.append(
+                    pad_or_sample(
+                        torch.from_numpy(f["coords"][:]),
+                        n=self.instances_per_bag,
+                        deterministic=self.deterministic,
                     )
-                )
-        feats = pad_or_sample(
-            torch.concat(feat_list).float(), 4096, deterministic=self.deterministic
-        )
+                ) if self.instances_per_bag else coord_list.append(torch.from_numpy(f["coords"][:]))
+                if "zoom" in f.keys():
+                    zoom_list.append(
+                        pad_or_sample(
+                            torch.from_numpy(f["zoom"][:]),
+                            n=self.instances_per_bag,
+                            deterministic=self.deterministic,
+                        )
+                    )  if self.instances_per_bag else zoom_list.append(torch.from_numpy(f["zoom"][:]))
+                else:
+                    zoom_list.append(
+                        pad_or_sample(
+                            torch.from_numpy(np.repeat(1,len(f["feats"][:]))),
+                            n=self.instances_per_bag,
+                            deterministic=self.deterministic,
+                        )
+                    ) if  self.instances_per_bag else zoom_list.append(torch.from_numpy(np.repeat(1,len(f["feats"][:]))))
+        if self.instances_per_bag:
+            feats = pad_or_sample(
+                torch.concat(feat_list).float(), n=self.instances_per_bag, deterministic=self.deterministic
+            )
+            coords = pad_or_sample(
+                torch.concat(coord_list).float(), n=self.instances_per_bag, deterministic=self.deterministic
+            )
+            zoom = pad_or_sample(
+                torch.concat(zoom_list).float(), n=self.instances_per_bag, deterministic=self.deterministic
+            )
 
-        return feats, self.labels[index]
+        assert len(coords)==len(feats), "Feature list length and Coordinate list length should be equal!" 
+        assert len(feats)==len(zoom), "Feature list length and Zoom list length should be the equal!"
+        
+        if self.zoom:
+            bags = torch.cat((feats,coords/1e+4),dim=-1)
+            bags = torch.cat((bags,zoom[:,None]/10),dim=-1)
+            return bags, self.labels[index]
+        else:
+            return feats, self.labels[index]
 
 
 def pad_or_sample(a: torch.Tensor, n: int, deterministic: bool):
@@ -168,7 +211,7 @@ class VisionTransformer(nn.Module):
         dim_feedforward: int = 2048,
     ) -> None:
         super().__init__()
-
+        
         # one class token per output class
         self.class_tokens = nn.Parameter(torch.rand(n_targets, d_model))
 
@@ -234,7 +277,7 @@ class BarspoonTransformer(nn.Module):
                  ┗━━┛      ┗━━┛           ┗━━┛   ┗━━┛
         """
         super().__init__()
-
+        
         # one class token per output class
         self.class_tokens = nn.Parameter(torch.rand(n_targets, d_model))
 
@@ -411,6 +454,7 @@ class LitBarspoonTransformer(LitMilClassificationMixin):
         dim_feedforward: int,  # = 2048,
         # other hparams
         learning_rate: float,  # = 1e-4,
+        zoom: bool, # False
         **hparams: Any,
     ) -> None:
         super().__init__(
@@ -486,38 +530,39 @@ def read_table(path: Path, dtype=str) -> pd.DataFrame:
 
 
 def get_splits(X, n_splits: int = 6):
-    # splitter = KFold(n_splits=n_splits, shuffle=True)
-    # folds = np.array([fold for _, fold in splitter.split(X=X)], dtype=object)
-    # for test_fold, test_fold_idxs in enumerate(folds):
-    #     val_fold = (test_fold + 1) % n_splits
-    #     val_fold_idxs = folds[val_fold]
+    if not exists("folds.npy"):
+        splitter = KFold(n_splits=n_splits, shuffle=True)
+        folds = np.array([fold for _, fold in splitter.split(X=X)], dtype=object)
+        for test_fold, test_fold_idxs in enumerate(folds):
+            val_fold = (test_fold + 1) % n_splits
+            val_fold_idxs = folds[val_fold]
 
-    #     train_folds = set(range(n_splits)) - {test_fold, val_fold}
-    #     train_fold_idxs = np.concatenate(folds[list(train_folds)])
+            train_folds = set(range(n_splits)) - {test_fold, val_fold}
+            train_fold_idxs = np.concatenate(folds[list(train_folds)])
 
-    #     yield (
-    #         train_fold_idxs.astype(int),
-    #         val_fold_idxs.astype(int),
-    #         test_fold_idxs.astype(int),
-    #     )
+            yield (
+                train_fold_idxs.astype(int),
+                val_fold_idxs.astype(int),
+                test_fold_idxs.astype(int),
+            )
+    else:
+        folds = [
+            cohort_df.index[cohort_df.PATIENT.isin(test_patients)].values
+            for test_patients in np.load("folds.npy")
+        ]
+        folds = np.array(folds)
+        for test_fold, test_fold_idxs in enumerate(folds):
+            val_fold = (test_fold + 1) % n_splits
+            val_fold_idxs = folds[val_fold]
 
-    folds = [
-        cohort_df.index[cohort_df.PATIENT.isin(test_patients)].values
-        for test_patients in np.load("folds.npy")
-    ]
-    folds = np.array(folds)
-    for test_fold, test_fold_idxs in enumerate(folds):
-        val_fold = (test_fold + 1) % n_splits
-        val_fold_idxs = folds[val_fold]
+            train_folds = set(range(n_splits)) - {test_fold, val_fold}
+            train_fold_idxs = np.concatenate(folds[list(train_folds)])
 
-        train_folds = set(range(n_splits)) - {test_fold, val_fold}
-        train_fold_idxs = np.concatenate(folds[list(train_folds)])
-
-        yield (
-            train_fold_idxs.astype(int),
-            val_fold_idxs.astype(int),
-            test_fold_idxs.astype(int),
-        )
+            yield (
+                train_fold_idxs.astype(int),
+                val_fold_idxs.astype(int),
+                test_fold_idxs.astype(int),
+            )
 
 
 # %%
@@ -540,7 +585,7 @@ if __name__ == "__main__":
     # other
     # args.instances_per_bag = round(2 ** random.uniform(9, 12))
     # args.learning_rate = 10 ** (random.uniform(-3, -5))
-    batch_size = 4
+    batch_size = 8
 
     clini_df = read_table(
         args.clini_table,
@@ -570,6 +615,7 @@ if __name__ == "__main__":
             [target_label.strip() for target_label in targets_file]
         )
     encoder = LabelEncoder()
+    cohort_df=cohort_df.dropna(subset=target_labels).reset_index()
     for target_label in target_labels:
         cohort_df[target_label] = encoder.fit_transform(cohort_df[target_label])
     target_labels = target_labels[cohort_df[target_labels].nunique(dropna=True) == 2]
@@ -578,7 +624,6 @@ if __name__ == "__main__":
         .select_dtypes(["int16", "int32", "int64", "float16", "float32", "float64"])
         .columns.values
     )
-
     targets = torch.Tensor(cohort_df[target_labels].apply(pd.to_numeric).values)
     bags = cohort_df.slide_path.values
     pos_samples = targets.nansum(dim=0)
@@ -589,7 +634,7 @@ if __name__ == "__main__":
         f"{k}={v}" for k, v in sorted(vars(args).items()) if isinstance(v, (int, float))
     )
 
-    for fold_no, (train_idx, valid_idx, test_idx) in enumerate(get_splits(X=targets)):
+    for fold_no, (train_idx, valid_idx, test_idx) in enumerate(get_splits(X=targets,n_splits=5)):
         run_dir = args.output_dir / configuration_str / f"{fold_no=}"
         print(f"{run_dir=}")
         if (run_dir / "done").exists():
@@ -604,6 +649,7 @@ if __name__ == "__main__":
             targets[train_idx],
             instances_per_bag=args.instances_per_bag,
             deterministic=False,
+            zoom=args.zoom,
         )
         train_dl = DataLoader(
             train_ds, batch_size=batch_size, num_workers=8, shuffle=True
@@ -614,6 +660,7 @@ if __name__ == "__main__":
             targets[valid_idx],
             instances_per_bag=args.instances_per_bag,
             deterministic=True,
+            zoom=args.zoom,
         )
         valid_dl = DataLoader(valid_ds, batch_size=batch_size, num_workers=8)
 
@@ -622,13 +669,16 @@ if __name__ == "__main__":
             targets[test_idx],
             instances_per_bag=2**12,
             deterministic=True,
+            zoom=args.zoom,
         )
         test_dl = DataLoader(test_ds, batch_size=1, num_workers=8)
+
 
         example_bags, _ = next(iter(train_dl))
         d_features = example_bags.size(-1)
 
-        model = LitVisionTransformer(
+
+        model = LitBarspoonTransformer(
             d_features=d_features,
             n_targets=len(target_labels),
             pos_weight=pos_weight,
@@ -657,7 +707,6 @@ if __name__ == "__main__":
             gradient_clip_val=0.5,
             logger=CSVLogger(save_dir=run_dir),
         )
-
         trainer.fit(model=model, train_dataloaders=train_dl, val_dataloaders=valid_dl)
         trainer.test(model=model, dataloaders=test_dl)
 
