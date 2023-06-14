@@ -1,6 +1,9 @@
+import logging
 from pathlib import Path
-from typing import Iterable, Optional, Sequence, Union
+from typing import Iterable, Literal, Optional, Sequence, Union
 
+import numpy as np
+import numpy.typing as npt
 import pandas as pd
 import torch
 
@@ -83,7 +86,7 @@ def read_table(table: Union[Path, pd.DataFrame], dtype=str) -> pd.DataFrame:
     if table.suffix == ".csv":
         return pd.read_csv(table, dtype=dtype, low_memory=False)  # type: ignore
     else:
-        return pd.read_excel(table, dtype=dtype, low_memory=False)  # type: ignore
+        return pd.read_excel(table, dtype=dtype)  # type: ignore
 
 
 def make_preds_df(
@@ -126,3 +129,48 @@ def make_preds_df(
     preds_df = preds_df.sort_values(by="loss")
 
     return preds_df
+
+
+def filter_targets(
+    train_df: pd.DataFrame,
+    target_labels: npt.NDArray[np.str_],
+    mode: Literal["raise", "warn", "ignore"] = "warn",
+) -> npt.NDArray[np.str_]:
+    label_count: pd.Series = train_df[target_labels].nunique(dropna=True)  # type: ignore
+    if (label_count != 2).any():
+        note_problem(
+            f"the following labels have the wrong number of entries: {dict(label_count[label_count != 2])}",
+            mode=mode,
+        )
+
+    target_labels = np.array(label_count.index)[label_count == 2]
+
+    numeric_labels = (
+        train_df[target_labels]
+        .select_dtypes(["int16", "int32", "int64", "float16", "float32", "float64"])
+        .columns.values
+    )
+    if non_numeric_labels := set(target_labels) - set(numeric_labels):
+        note_problem(f"non-numeric labels: {non_numeric_labels}", mode=mode)
+
+    target_labels = numeric_labels
+
+    return np.array(target_labels)
+
+
+def note_problem(msg, mode: Literal["raise", "warn", "ignore"]):
+    if mode == "raise":
+        raise RuntimeError(msg)
+    elif mode == "warn":
+        logging.warning(msg)
+    elif mode == "ignore":
+        return
+    else:
+        raise ValueError("unknown error propagation type", mode)
+
+
+def get_pos_weight(targets: torch.Tensor) -> torch.Tensor:
+    pos_samples = targets.nansum(dim=0)
+    neg_samples = (1 - targets).nansum(dim=0)
+    pos_weight = neg_samples / pos_samples
+    return pos_weight

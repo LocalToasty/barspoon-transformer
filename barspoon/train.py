@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 import argparse
-import logging
 import os
 from pathlib import Path
-from typing import Iterable, Literal, Sequence, Tuple
+from typing import Iterable, Sequence, Tuple
 
 import numpy as np
 import numpy.typing as npt
@@ -17,7 +16,7 @@ from torch.utils.data import DataLoader
 
 from .data import BagDataset
 from .model import LitEncDecTransformer
-from .utils import make_dataset_df, make_preds_df
+from .utils import filter_targets, get_pos_weight, make_dataset_df, make_preds_df
 
 
 def main():
@@ -35,6 +34,7 @@ def main():
             target_labels = [l.strip() for l in f if l]
 
     if args.valid_clini_tables or args.valid_slide_tables or args.valid_feature_dirs:
+        # read validation set from separate clini / slide table / feature dir
         train_df = make_dataset_df(
             clini_tables=args.clini_tables,
             slide_tables=args.slide_tables,
@@ -54,6 +54,7 @@ def main():
             target_labels=target_labels,
         )
     else:
+        # split validation set off main dataset
         dataset_df = make_dataset_df(
             clini_tables=args.clini_tables,
             slide_tables=args.slide_tables,
@@ -66,7 +67,8 @@ def main():
         train_items, valid_items = train_test_split(dataset_df.index, test_size=0.2)
         train_df, valid_df = dataset_df.loc[train_items], dataset_df.loc[valid_items]
 
-    # see if target labels are good, otherwise die a fiery death
+    # see if target labels are good, otherwise complain / die a fiery death
+    # depending on whether `--filter-targets` was set by the the user
     target_labels = filter_targets(
         train_df=train_df,
         target_labels=np.array(target_labels),
@@ -269,51 +271,6 @@ def make_argument_parser() -> argparse.ArgumentParser:
     training_parser.add_argument("--max-epochs", type=int, default=256)
 
     return parser
-
-
-def filter_targets(
-    train_df: pd.DataFrame,
-    target_labels: npt.NDArray[np.str_],
-    mode: Literal["raise", "warn", "ignore"] = "warn",
-) -> npt.NDArray[np.str_]:
-    label_count: pd.Series = train_df[target_labels].nunique(dropna=True)  # type: ignore
-    if (label_count != 2).any():
-        note_problem(
-            f"the following labels have the wrong number of entries: {dict(label_count[label_count != 2])}",
-            mode=mode,
-        )
-
-    target_labels = np.array(label_count.index)[label_count == 2]
-
-    numeric_labels = (
-        train_df[target_labels]
-        .select_dtypes(["int16", "int32", "int64", "float16", "float32", "float64"])
-        .columns.values
-    )
-    if non_numeric_labels := set(target_labels) - set(numeric_labels):
-        note_problem(f"non-numeric labels: {non_numeric_labels}", mode=mode)
-
-    target_labels = numeric_labels
-
-    return np.array(target_labels)
-
-
-def note_problem(msg, mode: Literal["raise", "warn", "ignore"]):
-    if mode == "raise":
-        raise RuntimeError(msg)
-    elif mode == "warn":
-        logging.warning(msg)
-    elif mode == "ignore":
-        return
-    else:
-        raise ValueError("unknown error propagation type", mode)
-
-
-def get_pos_weight(targets: torch.Tensor) -> torch.Tensor:
-    pos_samples = targets.nansum(dim=0)
-    neg_samples = (1 - targets).nansum(dim=0)
-    pos_weight = neg_samples / pos_samples
-    return pos_weight
 
 
 def make_dataloaders(

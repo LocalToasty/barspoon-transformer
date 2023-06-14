@@ -3,7 +3,7 @@
 import argparse
 import os
 from pathlib import Path
-from typing import Any, Iterable, Sequence, Tuple
+from typing import Any, Iterable, Iterator, Sequence, Tuple
 
 import numpy as np
 import numpy.typing as npt
@@ -17,8 +17,7 @@ from torch.utils.data import DataLoader
 
 from .data import BagDataset
 from .model import LitEncDecTransformer
-from .train import filter_targets, get_pos_weight
-from .utils import make_dataset_df, make_preds_df
+from .utils import filter_targets, get_pos_weight, make_dataset_df, make_preds_df
 
 
 def main():
@@ -56,7 +55,8 @@ def main():
             dataset_df.loc[test_idx],
         )
 
-        # see if target labels are good, otherwise die a fiery death
+        # see if target labels are good, otherwise complain / die a fiery death
+        # depending on whether `--filter-targets` was set by the the user
         target_labels = filter_targets(
             train_df=train_df,
             target_labels=np.array(target_labels),
@@ -124,6 +124,7 @@ def main():
 
         trainer.fit(model=model, train_dataloaders=train_dl, val_dataloaders=valid_dl)
 
+        # save best validation set predictions
         valid_preds = torch.cat(trainer.predict(model=model, dataloaders=valid_dl, return_predictions=True))  # type: ignore
         valid_preds_df = make_preds_df(
             predictions=valid_preds,
@@ -134,6 +135,7 @@ def main():
         )
         valid_preds_df.to_csv(fold_dir / "valid-patient-preds.csv")
 
+        # save test set predictions
         test_preds = torch.cat(trainer.predict(model=model, dataloaders=test_dl, return_predictions=True))  # type: ignore
         test_preds_df = make_preds_df(
             predictions=test_preds,
@@ -185,13 +187,6 @@ def make_argument_parser() -> argparse.ArgumentParser:
         required=True,
         action="append",
         help="Path containing the slide features as `h5` files. Can be specified multiple times",
-    )
-    parser.add_argument(
-        "--num-splits",
-        metavar="N",
-        type=int,
-        default=6,
-        help="Number of splits during cross-validation",
     )
 
     targets_parser = parser.add_mutually_exclusive_group(required=True)
@@ -253,13 +248,20 @@ def make_argument_parser() -> argparse.ArgumentParser:
     )
     training_parser.add_argument("--patience", type=int, default=16)
     training_parser.add_argument("--max-epochs", type=int, default=256)
+    training_parser.add_argument(
+        "--num-splits",
+        metavar="N",
+        type=int,
+        default=6,
+        help="Number of splits during cross-validation",
+    )
 
     return parser
 
 
 def get_splits(
     items: npt.NDArray[Any], n_splits: int = 6
-) -> Tuple[npt.NDArray[Any], npt.NDArray[Any], npt.NDArray[Any]]:
+) -> Iterator[Tuple[npt.NDArray[Any], npt.NDArray[Any], npt.NDArray[Any]]]:
     splitter = KFold(n_splits=n_splits, shuffle=True)
     folds = np.array([fold for _, fold in splitter.split(items)], dtype=int)
     for test_fold, test_fold_idxs in enumerate(folds):
@@ -287,7 +289,7 @@ def make_dataloaders(
     batch_size: int,
     instances_per_bag: int,
     num_workers: int,
-) -> Tuple[DataLoader, DataLoader]:
+) -> Tuple[DataLoader, DataLoader, DataLoader]:
     train_ds = BagDataset(
         bags=train_bags,
         targets=train_targets,
