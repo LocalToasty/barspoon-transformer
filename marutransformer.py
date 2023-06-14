@@ -38,7 +38,7 @@ if __name__ == "__main__":
     parser.add_argument("--num-layers", type=int, default=2)
     parser.add_argument("--d-model", type=int, default=512)
     parser.add_argument("--dim-feedforward", type=int, default=2048)
-    parser.add_argument("--instances-per-bag", type=int, default=2**11)
+    parser.add_argument("--instances-per-bag", type=int, default=2**12)
     parser.add_argument("--learning-rate", type=float, default=1e-4)
     parser.add_argument("--zoom", action='store_true',default=False)
     args = parser.parse_args()
@@ -616,6 +616,7 @@ if __name__ == "__main__":
         )
     encoder = LabelEncoder()
     cohort_df=cohort_df.dropna(subset=target_labels).reset_index()
+    print(f"Number of patients with sufficient label information: {len(cohort_df)}")
     for target_label in target_labels:
         cohort_df[target_label] = encoder.fit_transform(cohort_df[target_label])
     target_labels = target_labels[cohort_df[target_labels].nunique(dropna=True) == 2]
