@@ -5,7 +5,6 @@ from pathlib import Path
 from typing import Iterable, Sequence, Tuple
 
 import numpy as np
-import numpy.typing as npt
 import pandas as pd
 import pytorch_lightning as pl
 import torch

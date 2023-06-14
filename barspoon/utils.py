@@ -22,18 +22,18 @@ def make_dataset_df(
     h5s = {h5 for d in feature_dirs for h5 in d.glob("*.h5")}
     assert h5s, f"no features found in {feature_dirs}!"
     h5_df = pd.DataFrame(list(h5s), columns=["path"])
-    h5_df["slide"] = h5_df.path.map(lambda p: p.stem)
-    h5_df = h5_df.set_index("slide", verify_integrity=True)
+    h5_df[slide_col] = h5_df.path.map(lambda p: p.stem)
+    h5_df = h5_df.set_index(slide_col, verify_integrity=True)
     df = h5_df
 
     if slide_tables:
         slide_df = pd.concat([read_table(slide_table) for slide_table in slide_tables])
         patient_col = patient_col or "PATIENT" if "PATIENT" in slide_df else "patient"
         slide_col = slide_col or "FILENAME" if "FILENAME" in slide_df else "slide"
-        slide_df = slide_df[[patient_col, slide_col]].rename(
-            columns={patient_col: "patient", slide_col: "slide"}
+        slide_df = slide_df[[patient_col, slide_col]]
+        slide_df = slide_df.drop_duplicates().set_index(
+            slide_col, verify_integrity=True
         )
-        slide_df = slide_df.drop_duplicates().set_index("slide", verify_integrity=True)
         df = df.join(slide_df, how="inner").reset_index()
         assert not df.empty, "no match between features and slide table"
 
@@ -50,15 +50,15 @@ def make_dataset_df(
                 )
                 for clini_table in clini_tables
             ]
-        ).rename(columns={patient_col: "patient"})
+        )
         # select all the relevant available ground truths,
         # make sure there's no conflicting patient info
         clini_df = (
-            clini_df[["patient", *list(set(target_labels) & set(clini_df.columns))]]
+            clini_df[[patient_col, *list(set(target_labels) & set(clini_df.columns))]]
             .drop_duplicates()
-            .set_index("patient", verify_integrity=True)
+            .set_index(patient_col, verify_integrity=True)
         )
-        df = df.merge(clini_df.reset_index(), on="patient")
+        df = df.merge(clini_df.reset_index(), on=patient_col)
         assert not df.empty, "no match between slides and clini table"
 
     # At this point we have a dataframe containing
@@ -67,12 +67,12 @@ def make_dataset_df(
     # - the patient id (if a slide table was given)
     # - the ground truths for the target labels present in the clini table
 
-    group_by = group_by or "patient" if "patient" in df else "slide"
+    group_by = group_by or patient_col if patient_col in df else slide_col
 
     # Group paths and metadata by the specified column
     grouped_paths_df = df.groupby(group_by)[["path"]].aggregate(list)
     grouped_metadata_df = (
-        df.groupby(group_by).first().drop(columns=["path", "slide"], errors="ignore")
+        df.groupby(group_by).first().drop(columns=["path", slide_col], errors="ignore")
     )
     df = grouped_metadata_df.join(grouped_paths_df)
 
