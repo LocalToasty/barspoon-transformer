@@ -34,3 +34,4 @@ dependencies = [
 [project.scripts]
 "barspoon-train" = "barspoon.train:main"
 "barspoon-deploy" = "barspoon.deploy:main"
+"barspoon-crossval" = "barspoon.crossval:main"
