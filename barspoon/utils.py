@@ -1,3 +1,4 @@
+# %%
 import logging
 from pathlib import Path
 from typing import Iterable, Literal, Optional, Sequence, Union
@@ -123,7 +124,7 @@ def make_preds_df(
 ) -> pd.DataFrame:
     preds_df = pd.concat(
         [
-            base_df[target_labels],
+            base_df.loc[:, base_df.columns.isin(target_labels)],
             *[
                 pd.DataFrame(
                     {f"{target_label}_1": score, f"{target_label}_0": 1 - score},
@@ -140,18 +141,19 @@ def make_preds_df(
     # all target labels for which we have clinical information
     has_ground_truth = [t in base_df.columns for t in target_labels]
 
-    ys = predictions[:, has_ground_truth]
-    ts = torch.tensor(preds_df[target_labels].values)
-    # calculate the element-wise loss
-    preds_df["loss"] = torch.nn.functional.binary_cross_entropy_with_logits(
-        input=ys.where(~ts.isnan(), 0),
-        target=ts.where(~ts.isnan(), 0),
-        weight=weight[has_ground_truth] if weight is not None else None,
-        pos_weight=pos_weight[has_ground_truth] if pos_weight is not None else None,
-        reduction="none",
-    ).nanmean(dim=1)
+    if any(has_ground_truth):
+        ys = predictions[:, has_ground_truth]
+        ts = torch.tensor(preds_df[target_labels[has_ground_truth]].values)
+        # calculate the element-wise loss
+        preds_df["loss"] = torch.nn.functional.binary_cross_entropy_with_logits(
+            input=ys.where(~ts.isnan(), 0),
+            target=ts.where(~ts.isnan(), 0),
+            weight=weight[has_ground_truth] if weight is not None else None,
+            pos_weight=pos_weight[has_ground_truth] if pos_weight is not None else None,
+            reduction="none",
+        ).nanmean(dim=1)
 
-    preds_df = preds_df.sort_values(by="loss")
+        preds_df = preds_df.sort_values(by="loss")
 
     return preds_df
 
