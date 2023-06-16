@@ -39,7 +39,7 @@ def main():
             slide_tables=args.slide_tables,
             feature_dirs=args.feature_dirs,
             patient_col=args.patient_col,
-            slide_col=args.slide_col,
+            filename_col=args.filename_col,
             group_by=args.group_by,
             target_labels=target_labels,
         )
@@ -48,7 +48,7 @@ def main():
             slide_tables=args.valid_slide_tables or args.slide_tables,
             feature_dirs=args.valid_feature_dirs or args.feature_dirs,
             patient_col=args.patient_col,
-            slide_col=args.slide_col,
+            filename_col=args.filename_col,
             group_by=args.group_by,
             target_labels=target_labels,
         )
@@ -59,7 +59,7 @@ def main():
             slide_tables=args.slide_tables,
             feature_dirs=args.feature_dirs,
             patient_col=args.patient_col,
-            slide_col=args.slide_col,
+            filename_col=args.filename_col,
             group_by=args.group_by,
             target_labels=target_labels,
         )
@@ -235,12 +235,14 @@ def make_argument_parser() -> argparse.ArgumentParser:
         "--patient-col",
         metavar="COL",
         type=str,
+        default="patient",
         help="Name of the patient column",
     )
     parser.add_argument(
-        "--slide-col",
+        "--filename-col",
         metavar="COL",
         type=str,
+        default="filename",
         help="Name of the slide column",
     )
     parser.add_argument(
