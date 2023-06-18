@@ -53,13 +53,14 @@ if __name__ == "__main__":
     
     for i,t in enumerate(result_df.columns[1:]):
         
-        plt.title("Targets",fontsize=28)
         plt.plot(result_df["fold"],result_df[t],ls="dotted",marker='x',ms=8,label=f"{t.split('_')[1]}:{np.mean(result_df[t]):.3f}$\pm${np.std(result_df[t]):.3f}")
-    
+        
+    plt.title("Targets",fontsize=28)
     plt.legend(fontsize=16)
     plt.xlabel("Fold",fontsize=24)
     plt.ylabel("AUROC",fontsize=24)
-    plt.savefig(f"{args.run_path}/figs/aurocs.pdf",dpi=300)
     plt.tick_params(axis='both', which='both', labelsize=22)
+    plt.savefig(f"{args.run_path}/figs/aurocs.pdf",dpi=300)
+    
 
     
