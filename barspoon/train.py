@@ -22,7 +22,7 @@ def main():
     parser = make_argument_parser()
     args = parser.parse_args()
 
-    pl.seed_everything(0)
+    pl.seed_everything(args.seed)
     torch.set_float32_matmul_precision("medium")
 
     # read target labels from file, if need be
@@ -270,6 +270,7 @@ def make_argument_parser() -> argparse.ArgumentParser:
     )
     training_parser.add_argument("--patience", type=int, default=16)
     training_parser.add_argument("--max-epochs", type=int, default=256)
+    training_parser.add_argument("--seed", type=int, default=0)
 
     return parser
 
