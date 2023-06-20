@@ -191,7 +191,7 @@ class LitMilClassificationMixin(pl.LightningModule):
         # BCE ignoring the positions we don't have target labels for
         loss = F.binary_cross_entropy_with_logits(
             input=logits.where(~targets.isnan(), 0),
-            target=targets.where(~targets.isnan(), 0),
+            target=targets.where(~targets.isnan(), 0).type_as(logits),
             # weight=self.weight,
             pos_weight=self.pos_weight.type_as(logits)
             if self.pos_weight is not None

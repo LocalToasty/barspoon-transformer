@@ -147,7 +147,7 @@ def make_preds_df(
         # calculate the element-wise loss
         preds_df["loss"] = torch.nn.functional.binary_cross_entropy_with_logits(
             input=ys.where(~ts.isnan(), 0),
-            target=ts.where(~ts.isnan(), 0),
+            target=ts.where(~ts.isnan(), 0).type_as(ys),
             weight=weight[has_ground_truth] if weight is not None else None,
             pos_weight=pos_weight[has_ground_truth] if pos_weight is not None else None,
             reduction="none",
