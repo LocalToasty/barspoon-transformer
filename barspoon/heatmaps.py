@@ -55,6 +55,8 @@ def main():
         att_maps = compute_attention_maps(model, feats, coords, stride, args.batch_size)
         score_maps = compute_score_maps(model, feats, coords, stride)
 
+        mask = (att_maps > 0).any(axis=0)
+
         # save all the heatmaps
         (outdir := args.output_dir / h5_path.stem).mkdir(exist_ok=True, parents=True)
         for i, target_label in enumerate(target_labels):
@@ -64,14 +66,12 @@ def main():
             metadata.add_text("stride", str(stride))
             metadata.add_text("target_label", target_label)
 
+            att_im = plt.get_cmap("magma")(att_maps[i] / att_maps.max())
+            att_im[:, :, -1] = mask
             Image.fromarray(
-                np.uint8(255 * plt.get_cmap("magma")(att_maps[i] / att_maps[i].max())),
+                np.uint8(255 * att_im),
                 "RGBA",
             ).save(outdir / f"attention_{target_label}.png", pnginfo=metadata)
-
-            Image.fromarray(
-                np.uint8(255 * plt.get_cmap("coolwarm")(score_maps[i])), "RGBA"
-            ).save(outdir / f"score_{target_label}.png", pnginfo=metadata)
 
             # use scores as color, attention as alpha
             im = plt.get_cmap("coolwarm")(score_maps[i])
