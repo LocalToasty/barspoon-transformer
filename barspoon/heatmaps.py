@@ -24,7 +24,7 @@ def main():
 
     model = LitEncDecTransformer.load_from_checkpoint(
         checkpoint_path=args.checkpoint_path
-    ).to(torch.float)
+    ).to(torch.bfloat16)
 
     target_labels = model.hparams["target_labels"]
 
@@ -93,7 +93,11 @@ def compute_attention_maps(
     n_targs = len(model.hparams["target_labels"])
     atts = []
     feats_t = (
-        torch.tensor(feats).unsqueeze(0).to(torch.float).repeat(batch_size, 1, 1).cuda()
+        torch.tensor(feats)
+        .unsqueeze(0)
+        .to(torch.bfloat16)
+        .repeat(batch_size, 1, 1)
+        .cuda()
     )
     for idx in range(0, n_targs, batch_size):
         feats_t = feats_t.detach()  # zero grads of input features
@@ -116,7 +120,7 @@ def compute_score_maps(model, feats, coords, stride):
         An array of shape [n_dim, x, y]
     """
     with torch.no_grad():
-        feats_t = torch.tensor(feats).to(torch.float).unsqueeze(1).cuda()
+        feats_t = torch.tensor(feats).to(torch.bfloat16).unsqueeze(1).cuda()
         scores = model(feats_t).sigmoid().detach().cpu()
     score_maps = vals_to_im(scores, coords, stride)
     return score_maps
@@ -196,7 +200,7 @@ def make_argument_parser() -> argparse.ArgumentParser:
         help="Name of the slide column",
     )
 
-    parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument("--batch-size", type=int, default=0x20)
 
     return parser
 
