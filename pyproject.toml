@@ -35,3 +35,4 @@ dependencies = [
 "barspoon-train" = "barspoon.train:main"
 "barspoon-deploy" = "barspoon.deploy:main"
 "barspoon-crossval" = "barspoon.crossval:main"
+"barspoon-heatmaps" = "barspoon.heatmaps:main"
