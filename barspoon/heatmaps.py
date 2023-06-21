@@ -74,7 +74,7 @@ def main():
                     # metadata format semver
                     # update minor version when adding fields,
                     # major when removing fields / changing semantics
-                    version="flood-1.0.",
+                    version="barspoon-attention 0.1",
                     filename=h5_path.stem,
                     stride=str(stride),
                     target_label=target_label,
@@ -89,7 +89,7 @@ def main():
             Image.fromarray(np.uint8(255 * im), "RGBA").save(
                 outdir / f"map_{target_label}.png",
                 pnginfo=make_metadata(
-                    version="gestalt-1.0.",  # see above
+                    version="barspoon-map 0.1",  # see above
                     filename=h5_path.stem,
                     stride=str(stride),
                     target_label=target_label,
