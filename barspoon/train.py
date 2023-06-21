@@ -13,9 +13,14 @@ from pytorch_lightning.loggers import CSVLogger
 from sklearn.model_selection import train_test_split
 from torch.utils.data import DataLoader
 
-from .data import BagDataset
-from .model import LitEncDecTransformer
-from .utils import filter_targets, get_pos_weight, make_dataset_df, make_preds_df
+from barspoon.data import BagDataset
+from barspoon.model import LitEncDecTransformer
+from barspoon.utils import (
+    filter_targets,
+    get_pos_weight,
+    make_dataset_df,
+    make_preds_df,
+)
 
 
 def main():

@@ -7,9 +7,9 @@ import pytorch_lightning as pl
 import torch
 from torch.utils.data import DataLoader
 
-from .data import BagDataset
-from .model import LitEncDecTransformer
-from .utils import make_dataset_df, make_preds_df
+from barspoon.data import BagDataset
+from barspoon.model import LitEncDecTransformer
+from barspoon.utils import make_dataset_df, make_preds_df
 
 
 def main():

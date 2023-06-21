@@ -11,8 +11,8 @@ from PIL import Image
 from PIL.PngImagePlugin import PngInfo
 from tqdm import tqdm
 
-from .model import LitEncDecTransformer
-from .utils import make_dataset_df
+from barspoon.model import LitEncDecTransformer
+from barspoon.utils import make_dataset_df
 
 
 def main():
