@@ -29,13 +29,21 @@ class EncDecTransformer(nn.Module):
     decoded tokens through a fully connected layer to get a label-wise
     prediction.
 
-             +---+
-        t -->| E |--+
-             +---+  |
-                    v
-                  +---+   +---+
-        c ------->| D |-->|FCs|--> s
-                  +---+   +---+
+              +---+
+        t1 -->|   |--+
+         .    | E |  |
+         .    | x |  |
+         .    | n |  |
+        tn -->|   |--+
+              +---+  |
+                     v
+                   +---+   +---+
+        c1 ------->|   |-->|FC1|--> s1
+         .         | D |   +---+     .
+         .         | x |             .
+         .         | k |   +---+     .
+        ck ------->|   |-->|FCk|--> sk
+                   +---+   +---+
     """
 
     def __init__(
