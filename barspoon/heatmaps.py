@@ -61,24 +61,40 @@ def main():
         (outdir := args.output_dir / h5_path.stem).mkdir(exist_ok=True, parents=True)
         for i, target_label in enumerate(target_labels):
             # save metadata in slide
-            metadata = PngInfo()
-            metadata.add_text("filename", h5_path.stem)
-            metadata.add_text("stride", str(stride))
-            metadata.add_text("target_label", target_label)
+            # TODO attention scale
 
             att_im = plt.get_cmap("magma")(att_maps[i] / att_maps.max())
             att_im[:, :, -1] = mask
             Image.fromarray(
                 np.uint8(255 * att_im),
                 "RGBA",
-            ).save(outdir / f"attention_{target_label}.png", pnginfo=metadata)
+            ).save(
+                outdir / f"attention_{target_label}.png",
+                pnginfo=make_metadata(
+                    # metadata format semver
+                    # update minor version when adding fields,
+                    # major when removing fields / changing semantics
+                    version="flood-1.0.",
+                    filename=h5_path.stem,
+                    stride=str(stride),
+                    target_label=target_label,
+                    attention_scale=f"{att_maps.max():e}",
+                ),
+            )
 
             # use scores as color, attention as alpha
             im = plt.get_cmap("coolwarm")(score_maps[i])
             im[:, :, -1] = att_maps[i] / att_maps[i].max()
 
             Image.fromarray(np.uint8(255 * im), "RGBA").save(
-                outdir / f"map_{target_label}.png", pnginfo=metadata
+                outdir / f"map_{target_label}.png",
+                pnginfo=make_metadata(
+                    version="gestalt-1.0.",  # see above
+                    filename=h5_path.stem,
+                    stride=str(stride),
+                    target_label=target_label,
+                    attention_scale=f"{att_maps[i].max():e}",
+                ),
             )
 
 
@@ -133,6 +149,13 @@ def vals_to_im(scores, coords, stride) -> npt.NDArray[np.float_]:
     for s, c in zip(scores, coords, strict=True):
         im[:, c[1] // stride, c[0] // stride] = s.float()
     return im
+
+
+def make_metadata(**kwargs) -> PngInfo:
+    metadata = PngInfo()
+    for k, v in kwargs.items():
+        metadata.add_text(k, v)
+    return metadata
 
 
 def make_argument_parser() -> argparse.ArgumentParser:
