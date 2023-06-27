@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import os
+import tomllib
 from pathlib import Path
 from typing import Iterable, Sequence, Tuple
 
@@ -16,6 +17,7 @@ from torch.utils.data import DataLoader
 from barspoon.data import BagDataset
 from barspoon.model import LitEncDecTransformer
 from barspoon.utils import (
+    encode_targets,
     filter_targets,
     get_pos_weight,
     make_dataset_df,
@@ -30,12 +32,9 @@ def main():
     pl.seed_everything(args.seed)
     torch.set_float32_matmul_precision("medium")
 
-    # read target labels from file, if need be
-    if args.target_labels:
-        target_labels = args.target_labels
-    else:
-        with open(args.target_file) as f:
-            target_labels = [l.strip() for l in f if l]
+    with open(args.target_file, "rb") as target_toml_file:
+        target_info = tomllib.load(target_toml_file)
+    target_labels = list(target_info["targets"].keys())
 
     if args.valid_clini_tables or args.valid_slide_tables or args.valid_feature_dirs:
         # read validation set from separate clini / slide table / feature dir
@@ -71,19 +70,15 @@ def main():
         train_items, valid_items = train_test_split(dataset_df.index, test_size=0.2)
         train_df, valid_df = dataset_df.loc[train_items], dataset_df.loc[valid_items]
 
-    # see if target labels are good, otherwise complain / die a fiery death
-    # depending on whether `--filter-targets` was set by the the user
-    target_labels = filter_targets(
-        train_df=train_df,
-        target_labels=np.array(target_labels),
-        mode="warn" if args.filter_targets else "raise",
+    target_labels, train_encoded_targets, weights = encode_targets(
+        train_df, **target_info
     )
 
-    pos_weight = get_pos_weight(
-        torch.tensor(
-            train_df[target_labels].apply(pd.to_numeric).values, dtype=torch.float32
-        )
-    )
+    import logging
+
+    # FIXME ensure same order
+    logging.warning("UNFIXED BUG HERE! DON'T USE")
+    _, valid_encoded_targets, _ = encode_targets(valid_df, **target_info)
 
     assert not (
         overlap := set(train_df.index) & set(valid_df.index)
@@ -91,9 +86,9 @@ def main():
 
     train_dl, valid_dl = make_dataloaders(
         train_bags=train_df.path.values,
-        train_targets=torch.tensor(train_df[target_labels].apply(pd.to_numeric).values),  # type: ignore
+        train_targets=train_encoded_targets,
         valid_bags=valid_df.path.values,
-        valid_targets=torch.tensor(valid_df[target_labels].apply(pd.to_numeric).values),  # type: ignore
+        valid_targets=valid_encoded_targets,
         instances_per_bag=args.instances_per_bag,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
@@ -105,25 +100,24 @@ def main():
     model = LitEncDecTransformer(
         d_features=d_features,
         target_labels=target_labels,
-        pos_weight=pos_weight,
+        weights=weights,
         # other hparams
+        target_file=target_info,
         **{
             f"train_{train_df.index.name}": list(train_df.index),
             f"valid_{valid_df.index.name}": list(valid_df.index),
         },
-        **{k: v for k, v in vars(args).items() if k not in {"target_labels"}},
+        **{k: v for k, v in vars(args).items() if k not in {"target_file"}},
     )
 
     trainer = pl.Trainer(
         default_root_dir=args.output_dir,
         callbacks=[
-            EarlyStopping(
-                monitor="val_TopKMultilabelAUROC", mode="max", patience=args.patience
-            ),
+            EarlyStopping(monitor="val_loss", mode="min", patience=args.patience),
             ModelCheckpoint(
-                monitor="val_TopKMultilabelAUROC",
-                mode="max",
-                filename="checkpoint-{epoch:02d}-{val_TopKMultilabelAUROC:0.3f}",
+                monitor="val_loss",
+                mode="min",
+                filename="checkpoint-{epoch:02d}-{val_loss:0.3f}",
             ),
         ],
         max_epochs=args.max_epochs,
@@ -138,10 +132,10 @@ def main():
     predictions = torch.cat(trainer.predict(model=model, dataloaders=valid_dl, return_predictions=True))  # type: ignore
     preds_df = make_preds_df(
         predictions=predictions,
-        weight=None,  # TODO
-        pos_weight=model.pos_weight,
+        weights=model.weights,
         base_df=valid_df,
         target_labels=target_labels,
+        **target_info,
     )
     preds_df.to_csv(args.output_dir / "valid-patient-preds.csv")
 
@@ -214,21 +208,10 @@ def make_argument_parser() -> argparse.ArgumentParser:
         help="Path containing the slide features of the validation set as `h5` files. Can be specified multiple times",
     )
 
-    targets_parser = parser.add_mutually_exclusive_group(required=True)
-    targets_parser.add_argument(
-        "-t",
-        "--target-label",
-        metavar="LABEL",
-        type=str,
-        action="append",
-        dest="target_labels",
-        help="Target labels to train for. Can be specified multiple times",
-    )
-    targets_parser.add_argument(
+    parser.add_argument(
         "--target-file",
         metavar="PATH",
         type=Path,
-        help="A file containing a list of target labels, one per line.",
     )
     parser.add_argument(
         "--filter-targets",

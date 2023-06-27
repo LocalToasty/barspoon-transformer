@@ -14,7 +14,15 @@ from barspoon.utils import make_dataset_df, make_preds_df
 
 def main():
     parser = make_argument_parser()
-    args = parser.parse_args()
+    args = parser.parse_args(
+        [
+            "-o=../../foo-deploy",
+            "-f=../../features/epic/",
+            "-c=../../metadata/clini_unique.csv",
+            "-s=../../metadata/slide_epic.csv",
+            "-m=../../foo/lightning_logs/version_1/checkpoints/checkpoint-epoch=00-val_loss=0.560.ckpt",
+        ]
+    )
 
     torch.set_float32_matmul_precision("medium")
 
@@ -49,10 +57,10 @@ def main():
     predictions = torch.cat(trainer.predict(model=model, dataloaders=dl))  # type: ignore
     preds_df = make_preds_df(
         predictions=predictions,
-        weight=None,  # TODO
-        pos_weight=model.pos_weight,
+        weights=model.weights,
         base_df=dataset_df.drop(columns="path"),
         target_labels=target_labels,
+        **model.hparams["target_file"],
     )
 
     # save results
@@ -66,7 +74,6 @@ def make_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "-o",
         "--output-dir",
-        metavar="PATH",
         type=Path,
         required=True,
         help="Directory path for the output",
@@ -75,7 +82,7 @@ def make_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "-c",
         "--clini-table",
-        metavar="PATH",
+        metavar="CLINI_TABLE",
         dest="clini_tables",
         type=Path,
         action="append",
@@ -84,8 +91,8 @@ def make_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "-s",
         "--slide-table",
-        metavar="PATH",
         dest="slide_tables",
+        metavar="SLIDE_TABLE",
         type=Path,
         action="append",
         help="Path to the slide table. Can be specified multiple times",
@@ -93,7 +100,7 @@ def make_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "-f",
         "--feature-dir",
-        metavar="PATH",
+        metavar="FEATURE_DIR",
         dest="feature_dirs",
         type=Path,
         required=True,
@@ -104,7 +111,6 @@ def make_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "-m",
         "--checkpoint-path",
-        metavar="PATH",
         type=Path,
         required=True,
         help="Path to the checkpoint file",
@@ -112,14 +118,12 @@ def make_argument_parser() -> argparse.ArgumentParser:
 
     parser.add_argument(
         "--patient-col",
-        metavar="COL",
         type=str,
         default="patient",
         help="Name of the patient column",
     )
     parser.add_argument(
         "--filename-col",
-        metavar="COL",
         type=str,
         default="filename",
         help="Name of the slide column",
@@ -127,7 +131,6 @@ def make_argument_parser() -> argparse.ArgumentParser:
 
     parser.add_argument(
         "--group-by",
-        metavar="COL",
         type=str,
         help="How to group slides. If 'clini' table is given, default is 'patient'; otherwise, default is 'slide'",
     )

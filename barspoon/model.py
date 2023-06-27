@@ -1,8 +1,9 @@
 import math
 import re
 from collections.abc import Sequence
-from typing import Any, Literal, Optional, Tuple
+from typing import Any, Literal, Optional, Sequence, Tuple
 
+import numpy as np
 import pytorch_lightning as pl
 import torch
 import torch.nn.functional as F
@@ -149,37 +150,36 @@ class LitMilClassificationMixin(pl.LightningModule):
         self,
         *,
         target_labels: Sequence[str],
-        pos_weight: Optional[torch.Tensor],
+        weights: Sequence[torch.Tensor],
         # other hparams
         learning_rate: float = 1e-4,
         **hparams: Any,
     ) -> None:
         super().__init__()
-        _ = hparams  # so we don't get unused parameter warnings
+        _ = hparams  # So we don't get unused parameter warnings
 
         self.learning_rate = learning_rate
-        n_targets = len(target_labels)
 
         # use the same metrics for training, validation and testing
-        global_metrics = torchmetrics.MetricCollection(
-            [
-                TopKMultilabelAUROC(
-                    num_labels=n_targets, topk=max(int(n_targets * 0.2), 1)
-                )
-            ]
-        )
+        # global_metrics = torchmetrics.MetricCollection(
+        #     [
+        #         TopKMultilabelAUROC(
+        #             num_labels=n_targets, topk=max(int(n_targets * 0.2), 1)
+        #         )
+        #     ]
+        # )
         target_aurocs = torchmetrics.MetricCollection(
             {
-                sanatize(target_label): torchmetrics.classification.BinaryAUROC()
-                for target_label in target_labels
+                sanatize(target_label): SafeMulticlassAUROC(num_classes=len(weight))
+                for target_label, weight in zip(target_labels, weights)
             }
         )
         for step_name in ["train", "val", "test"]:
-            setattr(
-                self,
-                f"{step_name}_global_metrics",
-                global_metrics.clone(prefix=f"{step_name}_"),
-            )
+            # setattr(
+            #     self,
+            #     f"{step_name}_global_metrics",
+            #     global_metrics.clone(prefix=f"{step_name}_"),
+            # )
             setattr(
                 self,
                 f"{step_name}_target_aurocs",
@@ -187,8 +187,7 @@ class LitMilClassificationMixin(pl.LightningModule):
             )
 
         self.target_labels = target_labels
-        self.pos_weight = pos_weight
-        # self.register_buffer("weight", torch.ones(len(target_labels)))
+        self.weights = weights
 
         self.save_hyperparameters()
 
@@ -196,42 +195,59 @@ class LitMilClassificationMixin(pl.LightningModule):
         bags, targets = batch
         logits = self(bags)
 
-        # BCE ignoring the positions we don't have target labels for
-        loss = F.binary_cross_entropy_with_logits(
-            input=logits.where(~targets.isnan(), 0),
-            target=targets.where(~targets.isnan(), 0).type_as(logits),
-            # weight=self.weight,
-            pos_weight=self.pos_weight.type_as(logits)
-            if self.pos_weight is not None
-            else None,
+        # The column ranges belonging to each target
+        target_edges = np.cumsum([0, *(len(w) for w in self.weights)])
+        # Calculate the cross entropy loss for each target, then sum them
+        loss = sum(
+            F.cross_entropy(
+                logits[:, left:right],
+                targets[:, left:right].type_as(logits),
+                weight=weight.type_as(logits),
+            )
+            for left, right, weight in zip(
+                target_edges[:-1],  # Leftmost column belonging to target
+                target_edges[1:],  # Rightmost column belonging to target
+                self.weights,
+                # strict=True,  # Python 3.9 hates it
+            )
         )
 
         if step_name:
-            # update global metrics
-            global_metrics = getattr(self, f"{step_name}_global_metrics")
-            global_metrics.update(logits, targets.long())
-            self.log_dict(
-                global_metrics,
+            self.log(
+                f"{step_name}_loss",
+                loss,
                 on_step=False,
                 on_epoch=True,
                 prog_bar=True,
                 sync_dist=True,
             )
-            self.log(
-                f"{step_name}_loss", loss, on_step=True, on_epoch=True, sync_dist=True
-            )
 
-            # update target-wise metrics
-            for target_label, target_logits, target_ys in zip(
+            #     # Update global metrics
+            #     global_metrics = getattr(self, f"{step_name}_global_metrics")
+            #     global_metrics.update(logits, targets.long())
+            #     self.log_dict(
+            #         global_metrics,
+            #         on_step=False,
+            #         on_epoch=True,
+            #         prog_bar=True,
+            #         sync_dist=True,
+            #     )
+
+            # Update target-wise metrics
+            for target_label, left, right in zip(
                 self.target_labels,
-                logits.permute(-1, -2),
-                targets.permute(-1, -2),
-                # strict=True,  # python3.9 hates it
+                target_edges[:-1],
+                target_edges[1:],
+                # strict=True,  # Python 3.9 hates it
             ):
                 target_auroc = getattr(self, f"{step_name}_target_aurocs")[
                     sanatize(target_label)
                 ]
-                target_auroc.update(target_logits, target_ys)
+                is_na = (targets[:, left:right] == 0).all(dim=1)
+                target_auroc.update(
+                    logits[~is_na, left:right],
+                    targets[~is_na, left:right].argmax(dim=1),
+                )
                 self.log(
                     f"{step_name}_{target_label}_auroc",
                     target_auroc,
@@ -257,7 +273,16 @@ class LitMilClassificationMixin(pl.LightningModule):
         else:
             bag, _ = batch
         logits = self(bag)
-        return torch.sigmoid(logits)
+
+        target_edges = np.cumsum([0, *(len(w) for w in self.weights)])
+        softmaxed = torch.cat(
+            [
+                torch.softmax(logits[:, left:right], 1)
+                for left, right in zip(target_edges[:-1], target_edges[1:])
+            ],
+            dim=1,
+        )
+        return softmaxed
 
     def configure_optimizers(self):
         optimizer = torch.optim.Adam(self.parameters(), lr=self.learning_rate)
@@ -266,6 +291,21 @@ class LitMilClassificationMixin(pl.LightningModule):
 
 def sanatize(x: str) -> str:
     return re.sub(r"[^A-Za-z0-9_]", "_", x)
+
+
+class SafeMulticlassAUROC(torchmetrics.classification.MulticlassAUROC):
+    """A Multiclass AUROC that doesn't blow up when no targets are given"""
+
+    def compute(self) -> torch.Tensor:
+        # Add faux entry if there are none so far
+        if len(self.preds) == 0:
+            self.update(torch.zeros(1, self.num_classes), torch.zeros(1).long())
+        elif len(dim_zero_cat(self.preds)) == 0:
+            self.update(
+                torch.zeros(1, self.num_classes).type_as(self.preds[0]),
+                torch.zeros(1).long().type_as(self.target[0]),
+            )
+        return super().compute()
 
 
 class TopKMultilabelAUROC(torchmetrics.classification.MultilabelPrecisionRecallCurve):
@@ -310,7 +350,7 @@ class LitEncDecTransformer(LitMilClassificationMixin):
         *,
         d_features: int,
         target_labels: Sequence[str],
-        pos_weight: Optional[torch.Tensor],
+        weights: Sequence[torch.Tensor],
         # model parameters
         d_model: int = 512,
         num_encoder_heads: int = 8,
@@ -324,14 +364,14 @@ class LitEncDecTransformer(LitMilClassificationMixin):
     ) -> None:
         super().__init__(
             target_labels=target_labels,
-            pos_weight=pos_weight,
+            weights=weights,
             learning_rate=learning_rate,
         )
         _ = hparams  # so we don't get unused parameter warnings
 
         self.model = EncDecTransformer(
             d_features=d_features,
-            n_targets=len(target_labels),
+            n_targets=sum(len(w) for w in weights),
             d_model=d_model,
             num_encoder_heads=num_encoder_heads,
             num_decoder_heads=num_decoder_heads,

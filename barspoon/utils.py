@@ -1,12 +1,25 @@
-# %%
 import logging
+import tomllib
 from pathlib import Path
-from typing import Iterable, Literal, Optional, Sequence, Union
+from typing import Any, Dict, Iterable, List, Literal, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import numpy.typing as npt
 import pandas as pd
 import torch
+import torch.nn.functional as F
+from packaging.version import Version
+
+__all__ = [
+    "make_dataset_df",
+    "read_table",
+    "make_preds_df",
+    "filter_targets",
+    "note_problem",
+    "get_pos_weight",
+    "encode_targets",
+    "decode_targets",
+]
 
 
 def make_dataset_df(
@@ -117,44 +130,55 @@ def read_table(table: Union[Path, pd.DataFrame], dtype=str) -> pd.DataFrame:
 
 def make_preds_df(
     predictions: torch.Tensor,
-    weight: Optional[torch.Tensor],
-    pos_weight: Optional[torch.Tensor],
+    *,
+    weights: List[torch.Tensor],
     base_df: pd.DataFrame,
     target_labels: Sequence[str],
+    # From targets file #TODO don't use target file here
+    version: str = "barspoon-targets 1.0",
+    targets: Dict[str, Any],
+    **ignored,
 ) -> pd.DataFrame:
+    # Make sure target file has the right version
+    name, version = version.split(" ")
+    assert name == "barspoon-targets"
+    version = Version(version)
+    assert version >= Version("1.0-pre1") and version < Version("2.0")
+
+    # Warn user of unused labels
+    if ignored:
+        logging.warn(f"ignored labels in target {target_label}: {ignored}")
+
+    target_edges = np.cumsum([0, *(len(w) for w in weights)])
+
+    target_pred_dfs = []
+    for target_label, left, right in zip(
+        target_labels, target_edges[:-1], target_edges[1:]
+    ):
+        target_info = targets[target_label]
+        if (categories := target_info.get("categories")) is not None:
+            cat_labels = [c[0] for c in categories]
+        elif (thresholds := target_info.get("thresholds")) is not None:
+            bin_edges = [-np.inf, *thresholds, np.inf]
+            cat_labels = [
+                f"[{l:+1.2e};{u:+1.2e})" for l, u in zip(bin_edges[:-1], bin_edges[1:])
+            ]
+        else:
+            raise ValueError()  # TODO
+
+        target_pred_df = pd.DataFrame(
+            predictions[:, left:right],
+            columns=[f"{target_label}_{cat}" for cat in cat_labels],
+            index=base_df.index,
+        )
+        hard_prediction = np.array(cat_labels)[predictions[:, left:right].argmax(dim=1)]
+        target_pred_df[f"{target_label}_pred"] = hard_prediction
+
+        target_pred_dfs.append(target_pred_df)
+
     preds_df = pd.concat(
-        [
-            base_df.loc[:, base_df.columns.isin(target_labels)],
-            *[
-                pd.DataFrame(
-                    {f"{target_label}_1": score, f"{target_label}_0": 1 - score},
-                    index=base_df.index,
-                )
-                for target_label, score in zip(
-                    target_labels, predictions.transpose(1, 0)
-                )
-            ],
-        ],
-        axis=1,
+        [base_df.loc[:, base_df.columns.isin(target_labels)], *target_pred_dfs], axis=1
     ).copy()
-
-    # all target labels for which we have clinical information
-    has_ground_truth = [t in base_df.columns for t in target_labels]
-
-    if any(has_ground_truth):
-        ys = predictions[:, has_ground_truth]
-        ts = torch.tensor(preds_df[target_labels[has_ground_truth]].values)
-        # calculate the element-wise loss
-        preds_df["loss"] = torch.nn.functional.binary_cross_entropy_with_logits(
-            input=ys.where(~ts.isnan(), 0),
-            target=ts.where(~ts.isnan(), 0).type_as(ys),
-            weight=weight[has_ground_truth] if weight is not None else None,
-            pos_weight=pos_weight[has_ground_truth] if pos_weight is not None else None,
-            reduction="none",
-        ).nanmean(dim=1)
-
-        preds_df = preds_df.sort_values(by="loss")
-
     return preds_df
 
 
@@ -201,3 +225,187 @@ def get_pos_weight(targets: torch.Tensor) -> torch.Tensor:
     neg_samples = (1 - targets).nansum(dim=0)
     pos_weight = neg_samples / pos_samples
     return pos_weight
+
+
+def encode_targets(
+    clini_df: pd.DataFrame,
+    *,
+    targets: Dict[str, Any],
+    version: str = "barspoon-targets 1.0",
+    **ignored,
+) -> Tuple[List[str], torch.Tensor, torch.Tensor]:
+    """Encodes the information in a clini table into a tensor
+
+    Returns:
+        A tuple consisting of
+         1. A list of target labels
+         2. The encoded targets
+         3. A list of the targets' classes' weights
+    """
+    # Make sure target file has the right version
+    name, version = version.split(" ")
+    assert name == "barspoon-targets"
+    version = Version(version)
+    assert version >= Version("1.0-pre1") and version < Version("2.0")
+
+    if ignored:
+        logging.warn(f"ignored {ignored}")
+
+    target_labels, encoded_cols, weights = [], [], []
+    for target_label, info in targets.items():
+        if "categories" in info:
+            encoded, weight = encode_category(
+                clini_df=clini_df, target_label=target_label, **info
+            )
+            target_labels.append(target_label)
+            encoded_cols.append(encoded)
+            weights.append(weight)
+
+        elif "thresholds" in info:
+            encoded, weight = encode_quantize(
+                clini_df=clini_df, target_label=target_label, **info
+            )
+            target_labels.append(target_label)
+            encoded_cols.append(encoded)
+            weights.append(weight)
+
+        else:
+            logging.warn(f"ignoring unrecognized target type {target_label}")
+
+    assert len(encoded_cols) == len(weights)
+    return target_labels, torch.cat(encoded_cols, dim=1), weights
+
+
+def encode_category(
+    *,
+    clini_df: pd.DataFrame,
+    target_label: str,
+    categories: List[List[str]],
+    class_weights: Optional[Dict[str, float]] = None,
+    **ignored,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    # Map each category to its index
+    category_map = {member: idx for idx, cat in enumerate(categories) for member in cat}
+
+    # Map each item to it's category's index, mapping nans to num_classes+1
+    # This way we can easily discard the NaN column later
+    indexes = clini_df[target_label].map(lambda c: category_map.get(c, len(categories)))
+    indexes = torch.tensor(indexes.values)
+
+    # Discard nan column
+    one_hot = F.one_hot(indexes, num_classes=len(categories) + 1)[:, :-1]
+
+    # Class weights
+    if class_weights is not None:
+        weight = torch.tensor([class_weights[c[0]] for c in categories])
+    else:
+        # No class weights given; use normalized inverse frequency
+        counts = one_hot.sum(dim=0)
+        weight = (w := (counts.sum() / counts)) / w.sum()
+
+    # Warn user of unused labels
+    if ignored:
+        logging.warn(f"ignored labels in target {target_label}: {ignored}")
+
+    return one_hot, weight
+
+
+def encode_quantize(
+    *,
+    clini_df: pd.DataFrame,
+    target_label: str,
+    thresholds: List[float],
+    class_weights: Optional[Dict[str, float]] = None,
+    **ignored,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    # Warn user of unused labels
+    if ignored:
+        logging.warn(f"ignored labels in target {target_label}: {ignored}")
+
+    n_bins = len(thresholds) + 1
+    numeric_vals = torch.tensor(pd.to_numeric(clini_df[target_label]).values).view(
+        -1, 1
+    )
+    bin_edges = torch.tensor([-np.inf, *thresholds, np.inf])
+    # Count the number of left bounds of bins each item is greater or equal than
+    # This will lead to nans being mapped to 0,
+    # whereas each other classes will be set to C+1
+    bin_index = (numeric_vals >= bin_edges[:-1].view(1, -1)).count_nonzero(dim=1)
+    # One hot encode and discard nan column
+    # This maps all classes from C+1 back to C
+    one_hot = F.one_hot(bin_index, num_classes=n_bins + 1)[:, 1:]
+
+    # Class weights
+    if class_weights is not None:
+        weight = torch.tensor(
+            [
+                class_weights[f"[{l:+1.2e};{u:+1.2e})"]
+                for l, u in zip(bin_edges[:-1], bin_edges[1:])
+            ]
+        )
+    else:
+        # No class weights given; use 1/#bins
+        weight = torch.tensor([1 / n_bins] * n_bins)
+
+    return one_hot, weight
+
+
+def decode_targets(
+    encoded: torch.Tensor,
+    *,
+    target_labels: Sequence[str],
+    targets: Dict[str, Any],
+    version: str = "barspoon-targets 1.0",
+    **ignored,
+) -> List[np.array]:
+    name, version = version.split(" ")
+    assert name == "barspoon-targets"
+    version = Version(version)
+    assert version >= Version("1.0-pre1") and version < Version("2.0")
+
+    # Warn user of unused labels
+    if ignored:
+        logging.warn(f"ignored labels in target {target_label}: {ignored}")
+
+    decoded_targets = []
+    curr_col = 0
+    for target_label in target_labels:
+        info = targets[target_label]
+
+        if (categories := info.get("categories")) is not None:
+            # Add another column which is one iff all the other values are zero
+            encoded_target = encoded[:, curr_col : curr_col + len(categories)]
+            is_none = ~encoded_target.any(dim=1).view(-1, 1)
+            encoded_target = torch.cat([encoded_target, is_none], dim=1)
+
+            # Decode to class labels
+            representatives = np.array([c[0] for c in categories] + [None])
+            category_index = encoded_target.argmax(dim=1)
+            decoded = representatives[category_index]
+            decoded_targets.append(decoded)
+
+            curr_col += len(categories)
+
+        elif (thresholds := info.get("thresholds")) is not None:
+            n_bins = len(thresholds) + 1
+            encoded_target = encoded[:, curr_col : curr_col + n_bins]
+            is_none = ~encoded_target.any(dim=1).view(-1, 1)
+            encoded_target = torch.cat([encoded_target, is_none], dim=1)
+
+            bin_edges = [-np.inf, *thresholds, np.inf]
+            representatives = np.array(
+                [
+                    f"[{l:+1.2e};{u:+1.2e})"
+                    for l, u in zip(bin_edges[:-1], bin_edges[1:])
+                ]
+            )
+            decoded = representatives[encoded_target.argmax(dim=1)]
+
+            decoded_targets.append(decoded)
+
+            curr_col += n_bins
+
+        else:
+            raise ValueError(f"cannot decode {target_label}: no target info")
+
+    return decoded_targets
