@@ -16,7 +16,6 @@ def main():
     parser = make_argument_parser()
     args = parser.parse_args()
 
-    pl.seed_everything(0)
     torch.set_float32_matmul_precision("medium")
 
     model = LitEncDecTransformer.load_from_checkpoint(
