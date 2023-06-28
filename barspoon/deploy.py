@@ -14,15 +14,7 @@ from barspoon.utils import make_dataset_df, make_preds_df
 
 def main():
     parser = make_argument_parser()
-    args = parser.parse_args(
-        [
-            "-o=../../foo-deploy",
-            "-f=../../features/epic/",
-            "-c=../../metadata/clini_unique.csv",
-            "-s=../../metadata/slide_epic.csv",
-            "-m=../../foo/lightning_logs/version_1/checkpoints/checkpoint-epoch=00-val_loss=0.560.ckpt",
-        ]
-    )
+    args = parser.parse_args()
 
     torch.set_float32_matmul_precision("medium")
 
@@ -41,7 +33,7 @@ def main():
         target_labels=target_labels,
     )
 
-    # make a dataset with faux labels (the labels will be ignored)
+    # Make a dataset with faux labels (the labels will be ignored)
     ds = BagDataset(
         bags=list(dataset_df.path),
         targets=torch.zeros(len(dataset_df), 0),

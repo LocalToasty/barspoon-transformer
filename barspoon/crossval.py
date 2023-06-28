@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-# %%
 import argparse
 import os
+import tomllib
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Sequence, Tuple
 
@@ -15,9 +15,9 @@ from pytorch_lightning.loggers import CSVLogger
 from sklearn.model_selection import KFold
 from torch.utils.data import DataLoader
 
-from .data import BagDataset
-from .model import LitEncDecTransformer
-from .utils import filter_targets, get_pos_weight, make_dataset_df, make_preds_df
+from barspoon.data import BagDataset
+from barspoon.model import LitEncDecTransformer
+from barspoon.utils import encode_targets, make_dataset_df, make_preds_df
 
 
 def main():
@@ -27,12 +27,9 @@ def main():
     pl.seed_everything(args.seed)
     torch.set_float32_matmul_precision("medium")
 
-    # read target labels from file, if need be
-    if args.target_labels:
-        target_labels = args.target_labels
-    else:
-        with open(args.target_file) as f:
-            target_labels = [l.strip() for l in f if l]
+    with open(args.target_file, "rb") as target_toml_file:
+        target_info = tomllib.load(target_toml_file)
+    target_labels = list(target_info["targets"].keys())
 
     dataset_df = make_dataset_df(
         clini_tables=args.clini_tables,
@@ -55,31 +52,29 @@ def main():
             dataset_df.loc[test_idx],
         )
 
-        # see if target labels are good, otherwise complain / die a fiery death
-        # depending on whether `--filter-targets` was set by the the user
-        target_labels = filter_targets(
-            train_df=train_df,
-            target_labels=np.array(target_labels),
-            mode="warn" if args.filter_targets else "raise",
-        )
-
-        pos_weight = get_pos_weight(
-            torch.tensor(
-                train_df[target_labels].apply(pd.to_numeric).values, dtype=torch.float32
-            )
-        )
-
         assert not (
             overlap := set(train_df.index) & set(valid_df.index)
         ), f"overlap between training and testing set: {overlap}"
 
+        target_labels, train_encoded_targets, weights = encode_targets(
+            train_df, **target_info
+        )
+
+        _, valid_encoded_targets, _ = encode_targets(
+            valid_df, target_labels=target_labels, **target_info
+        )
+
+        _, test_encoded_targets, _ = encode_targets(
+            test_df, target_labels=target_labels, **target_info
+        )
+
         train_dl, valid_dl, test_dl = make_dataloaders(
             train_bags=train_df.path.values,
-            train_targets=torch.tensor(train_df[target_labels].apply(pd.to_numeric).values),  # type: ignore
+            train_targets=train_encoded_targets,
             valid_bags=valid_df.path.values,
-            valid_targets=torch.tensor(valid_df[target_labels].apply(pd.to_numeric).values),  # type: ignore
+            valid_targets=valid_encoded_targets,  # type: ignore
             test_bags=test_df.path.values,
-            test_targets=torch.tensor(test_df[target_labels].apply(pd.to_numeric).values),  # type: ignore
+            test_targets=test_encoded_targets,  # type: ignore
             instances_per_bag=args.instances_per_bag,
             batch_size=args.batch_size,
             num_workers=args.num_workers,
@@ -91,7 +86,7 @@ def main():
         model = LitEncDecTransformer(
             d_features=d_features,
             target_labels=target_labels,
-            pos_weight=pos_weight,
+            weights=weights,
             # other hparams
             **{
                 f"train_{train_df.index.name}": list(train_df.index),
@@ -124,25 +119,25 @@ def main():
 
         trainer.fit(model=model, train_dataloaders=train_dl, val_dataloaders=valid_dl)
 
-        # save best validation set predictions
+        # Save best validation set predictions
         valid_preds = torch.cat(trainer.predict(model=model, dataloaders=valid_dl, return_predictions=True))  # type: ignore
         valid_preds_df = make_preds_df(
             predictions=valid_preds,
-            weight=None,  # TODO
-            pos_weight=model.pos_weight,
+            weigths=model.weights,
             base_df=valid_df,
             target_labels=target_labels,
+            **target_info,
         )
         valid_preds_df.to_csv(fold_dir / "valid-patient-preds.csv")
 
-        # save test set predictions
+        # Save test set predictions
         test_preds = torch.cat(trainer.predict(model=model, dataloaders=test_dl, return_predictions=True))  # type: ignore
         test_preds_df = make_preds_df(
             predictions=test_preds,
-            weight=None,  # TODO
-            pos_weight=model.pos_weight,
+            weigths=model.weights,
             base_df=test_df,
             target_labels=target_labels,
+            **target_info,
         )
         test_preds_df.to_csv(fold_dir / "patient-preds.csv")
 
@@ -152,7 +147,6 @@ def make_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "-o",
         "--output-dir",
-        metavar="PATH",
         type=Path,
         required=True,
         help="Directory path for the output",
@@ -161,7 +155,7 @@ def make_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "-c",
         "--clini-table",
-        metavar="PATH",
+        metavar="CLINI_TABLE",
         dest="clini_tables",
         type=Path,
         required=True,
@@ -171,7 +165,7 @@ def make_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "-s",
         "--slide-table",
-        metavar="PATH",
+        metavar="SLIDE_TABLE",
         dest="slide_tables",
         type=Path,
         required=True,
@@ -181,7 +175,7 @@ def make_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "-f",
         "--feature-dir",
-        metavar="PATH",
+        metavar="FEATURE_DIR",
         dest="feature_dirs",
         type=Path,
         required=True,
@@ -189,26 +183,10 @@ def make_argument_parser() -> argparse.ArgumentParser:
         help="Path containing the slide features as `h5` files. Can be specified multiple times",
     )
 
-    targets_parser = parser.add_mutually_exclusive_group(required=True)
-    targets_parser.add_argument(
-        "-t",
-        "--target-label",
-        metavar="LABEL",
-        type=str,
-        action="append",
-        dest="target_labels",
-        help="Target labels to train for. Can be specified multiple times",
-    )
-    targets_parser.add_argument(
+    parser.add_argument(
         "--target-file",
         metavar="PATH",
         type=Path,
-        help="A file containing a list of target labels, one per line.",
-    )
-    parser.add_argument(
-        "--filter-targets",
-        action="store_true",
-        help="Automatically filter out nonsensical targets",
     )
 
     parser.add_argument(

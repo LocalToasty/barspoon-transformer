@@ -1,10 +1,8 @@
 import logging
-import tomllib
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Literal, Optional, Sequence, Tuple, Union
 
 import numpy as np
-import numpy.typing as npt
 import pandas as pd
 import torch
 import torch.nn.functional as F
@@ -14,9 +12,7 @@ __all__ = [
     "make_dataset_df",
     "read_table",
     "make_preds_df",
-    "filter_targets",
     "note_problem",
-    "get_pos_weight",
     "encode_targets",
     "decode_targets",
 ]
@@ -159,9 +155,9 @@ def make_preds_df(
         if (categories := target_info.get("categories")) is not None:
             cat_labels = [c[0] for c in categories]
         elif (thresholds := target_info.get("thresholds")) is not None:
-            bin_edges = [-np.inf, *thresholds, np.inf]
             cat_labels = [
-                f"[{l:+1.2e};{u:+1.2e})" for l, u in zip(bin_edges[:-1], bin_edges[1:])
+                f"[{l:+1.2e};{u:+1.2e})"
+                for l, u in zip(thresholds[:-1], thresholds[1:])
             ]
         else:
             raise ValueError()  # TODO
@@ -182,33 +178,6 @@ def make_preds_df(
     return preds_df
 
 
-def filter_targets(
-    train_df: pd.DataFrame,
-    target_labels: npt.NDArray[np.str_],
-    mode: Literal["raise", "warn", "ignore"] = "warn",
-) -> npt.NDArray[np.str_]:
-    label_count: pd.Series = train_df[target_labels].nunique(dropna=True)  # type: ignore
-    if (label_count != 2).any():
-        note_problem(
-            f"the following labels have the wrong number of entries: {dict(label_count[label_count != 2])}",
-            mode=mode,
-        )
-
-    target_labels = np.array(label_count.index)[label_count == 2]
-
-    numeric_labels = (
-        train_df[target_labels]
-        .select_dtypes(["int16", "int32", "int64", "float16", "float32", "float64"])
-        .columns.values
-    )
-    if non_numeric_labels := set(target_labels) - set(numeric_labels):
-        note_problem(f"non-numeric labels: {non_numeric_labels}", mode=mode)
-
-    target_labels = numeric_labels
-
-    return np.array(target_labels)
-
-
 def note_problem(msg, mode: Literal["raise", "warn", "ignore"]):
     if mode == "raise":
         raise RuntimeError(msg)
@@ -220,18 +189,13 @@ def note_problem(msg, mode: Literal["raise", "warn", "ignore"]):
         raise ValueError("unknown error propagation type", mode)
 
 
-def get_pos_weight(targets: torch.Tensor) -> torch.Tensor:
-    pos_samples = targets.nansum(dim=0)
-    neg_samples = (1 - targets).nansum(dim=0)
-    pos_weight = neg_samples / pos_samples
-    return pos_weight
-
-
 def encode_targets(
     clini_df: pd.DataFrame,
     *,
-    targets: Dict[str, Any],
+    target_labels: Optional[Iterable[str]] = None,
+    # From targets toml
     version: str = "barspoon-targets 1.0",
+    targets: Dict[str, Any],
     **ignored,
 ) -> Tuple[List[str], torch.Tensor, torch.Tensor]:
     """Encodes the information in a clini table into a tensor
@@ -251,13 +215,15 @@ def encode_targets(
     if ignored:
         logging.warn(f"ignored {ignored}")
 
-    target_labels, encoded_cols, weights = [], [], []
-    for target_label, info in targets.items():
+    target_labels = list(target_labels or targets)
+    encoded_cols, weights = [], []
+    for target_label in target_labels:
+        info = targets[target_label]
+
         if "categories" in info:
             encoded, weight = encode_category(
                 clini_df=clini_df, target_label=target_label, **info
             )
-            target_labels.append(target_label)
             encoded_cols.append(encoded)
             weights.append(weight)
 
@@ -265,7 +231,6 @@ def encode_targets(
             encoded, weight = encode_quantize(
                 clini_df=clini_df, target_label=target_label, **info
             )
-            target_labels.append(target_label)
             encoded_cols.append(encoded)
             weights.append(weight)
 
@@ -322,25 +287,24 @@ def encode_quantize(
     if ignored:
         logging.warn(f"ignored labels in target {target_label}: {ignored}")
 
-    n_bins = len(thresholds) + 1
+    n_bins = len(thresholds) - 1
     numeric_vals = torch.tensor(pd.to_numeric(clini_df[target_label]).values).view(
         -1, 1
     )
-    bin_edges = torch.tensor([-np.inf, *thresholds, np.inf])
     # Count the number of left bounds of bins each item is greater or equal than
     # This will lead to nans being mapped to 0,
     # whereas each other classes will be set to C+1
-    bin_index = (numeric_vals >= bin_edges[:-1].view(1, -1)).count_nonzero(dim=1)
-    # One hot encode and discard nan column
-    # This maps all classes from C+1 back to C
-    one_hot = F.one_hot(bin_index, num_classes=n_bins + 1)[:, 1:]
+    bin_index = (numeric_vals >= thresholds.view(1, -1)).count_nonzero(dim=1)
+    # One hot encode and discard nan columns (first and last col)
+    # This also maps all classes from C+1 back to C
+    one_hot = F.one_hot(bin_index, num_classes=n_bins + 2)[:, 1:-1]
 
     # Class weights
     if class_weights is not None:
         weight = torch.tensor(
             [
                 class_weights[f"[{l:+1.2e};{u:+1.2e})"]
-                for l, u in zip(bin_edges[:-1], bin_edges[1:])
+                for l, u in zip(thresholds[:-1], thresholds[1:])
             ]
         )
     else:
@@ -387,7 +351,7 @@ def decode_targets(
             curr_col += len(categories)
 
         elif (thresholds := info.get("thresholds")) is not None:
-            n_bins = len(thresholds) + 1
+            n_bins = len(thresholds) - 1
             encoded_target = encoded[:, curr_col : curr_col + n_bins]
             is_none = ~encoded_target.any(dim=1).view(-1, 1)
             encoded_target = torch.cat([encoded_target, is_none], dim=1)

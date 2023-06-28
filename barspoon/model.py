@@ -308,42 +308,6 @@ class SafeMulticlassAUROC(torchmetrics.classification.MulticlassAUROC):
         return super().compute()
 
 
-class TopKMultilabelAUROC(torchmetrics.classification.MultilabelPrecisionRecallCurve):
-    """Computes the AUROC of the K best-performing targets"""
-
-    is_differentiable: bool = False
-    higher_is_better: Optional[bool] = None
-    full_state_update: bool = False
-
-    def __init__(
-        self,
-        num_labels: int,
-        topk: int,
-        average: Optional[Literal["micro", "macro", "weighted", "none"]] = "macro",
-    ) -> None:
-        super().__init__(num_labels=num_labels, validate_args=False)
-        self.topk = topk
-        self.average = average
-
-    def compute(self) -> Tensor:  # type: ignore
-        state = (dim_zero_cat(self.preds), dim_zero_cat(self.target))  # type: ignore
-        individual_aurocs = _multilabel_auroc_compute(
-            state, self.num_labels, average="none", thresholds=None
-        )
-        assert isinstance(individual_aurocs, Tensor)
-        topk_idx = select_topk(individual_aurocs, self.topk, dim=0).bool()
-
-        state = (
-            dim_zero_cat(self.preds)[:, topk_idx],  # type: ignore
-            dim_zero_cat(self.target)[:, topk_idx],  # type: ignore
-        )
-        auroc = _multilabel_auroc_compute(
-            state, self.topk, average=self.average, thresholds=None
-        )
-        assert isinstance(auroc, Tensor)
-        return auroc
-
-
 class LitEncDecTransformer(LitMilClassificationMixin):
     def __init__(
         self,

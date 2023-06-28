@@ -5,8 +5,6 @@ import tomllib
 from pathlib import Path
 from typing import Iterable, Sequence, Tuple
 
-import numpy as np
-import pandas as pd
 import pytorch_lightning as pl
 import torch
 from pytorch_lightning.callbacks import EarlyStopping, ModelCheckpoint
@@ -16,13 +14,7 @@ from torch.utils.data import DataLoader
 
 from barspoon.data import BagDataset
 from barspoon.model import LitEncDecTransformer
-from barspoon.utils import (
-    encode_targets,
-    filter_targets,
-    get_pos_weight,
-    make_dataset_df,
-    make_preds_df,
-)
+from barspoon.utils import encode_targets, make_dataset_df, make_preds_df
 
 
 def main():
@@ -74,11 +66,9 @@ def main():
         train_df, **target_info
     )
 
-    import logging
-
-    # FIXME ensure same order
-    logging.warning("UNFIXED BUG HERE! DON'T USE")
-    _, valid_encoded_targets, _ = encode_targets(valid_df, **target_info)
+    _, valid_encoded_targets, _ = encode_targets(
+        valid_df, target_labels=target_labels, **target_info
+    )
 
     assert not (
         overlap := set(train_df.index) & set(valid_df.index)
@@ -212,11 +202,6 @@ def make_argument_parser() -> argparse.ArgumentParser:
         "--target-file",
         metavar="PATH",
         type=Path,
-    )
-    parser.add_argument(
-        "--filter-targets",
-        action="store_true",
-        help="Automatically filter out nonsensical targets",
     )
 
     parser.add_argument(
