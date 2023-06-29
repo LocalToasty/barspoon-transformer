@@ -61,8 +61,6 @@ def main():
         (outdir := args.output_dir / h5_path.stem).mkdir(exist_ok=True, parents=True)
         for i, target_label in enumerate(target_labels):
             # save metadata in slide
-            # TODO attention scale
-
             att_im = plt.get_cmap("magma")(att_maps[i] / att_maps.max())
             att_im[:, :, -1] = mask
             Image.fromarray(

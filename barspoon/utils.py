@@ -71,15 +71,7 @@ def make_dataset_df(
             "or the patient column has to be specified with `--patient-col <COL>`"
         )
 
-        clini_df = pd.concat(
-            [
-                read_table(
-                    clini_table,
-                    dtype={patient_col: str},
-                )
-                for clini_table in clini_tables
-            ]
-        )
+        clini_df = pd.concat([read_table(clini_table) for clini_table in clini_tables])
         # select all the relevant available ground truths,
         # make sure there's no conflicting patient info
         clini_df = (

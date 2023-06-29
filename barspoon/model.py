@@ -160,14 +160,6 @@ class LitMilClassificationMixin(pl.LightningModule):
 
         self.learning_rate = learning_rate
 
-        # use the same metrics for training, validation and testing
-        # global_metrics = torchmetrics.MetricCollection(
-        #     [
-        #         TopKMultilabelAUROC(
-        #             num_labels=n_targets, topk=max(int(n_targets * 0.2), 1)
-        #         )
-        #     ]
-        # )
         target_aurocs = torchmetrics.MetricCollection(
             {
                 sanatize(target_label): SafeMulticlassAUROC(num_classes=len(weight))
@@ -175,11 +167,6 @@ class LitMilClassificationMixin(pl.LightningModule):
             }
         )
         for step_name in ["train", "val", "test"]:
-            # setattr(
-            #     self,
-            #     f"{step_name}_global_metrics",
-            #     global_metrics.clone(prefix=f"{step_name}_"),
-            # )
             setattr(
                 self,
                 f"{step_name}_target_aurocs",
@@ -221,17 +208,6 @@ class LitMilClassificationMixin(pl.LightningModule):
                 prog_bar=True,
                 sync_dist=True,
             )
-
-            #     # Update global metrics
-            #     global_metrics = getattr(self, f"{step_name}_global_metrics")
-            #     global_metrics.update(logits, targets.long())
-            #     self.log_dict(
-            #         global_metrics,
-            #         on_step=False,
-            #         on_epoch=True,
-            #         prog_bar=True,
-            #         sync_dist=True,
-            #     )
 
             # Update target-wise metrics
             for target_label, left, right in zip(
