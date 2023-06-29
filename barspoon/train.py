@@ -135,7 +135,7 @@ def make_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "-o",
         "--output-dir",
-        metavar="PATH",
+        metavar="OUTPUT_DIR",
         type=Path,
         required=True,
         help="Directory path for the output",
@@ -144,7 +144,7 @@ def make_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "-c",
         "--clini-table",
-        metavar="PATH",
+        metavar="CLINI_TABLE",
         dest="clini_tables",
         type=Path,
         required=True,
@@ -154,7 +154,7 @@ def make_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "-s",
         "--slide-table",
-        metavar="PATH",
+        metavar="SLIDE_TABLE",
         dest="slide_tables",
         type=Path,
         required=True,
@@ -164,7 +164,7 @@ def make_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "-f",
         "--feature-dir",
-        metavar="PATH",
+        metavar="FEATURE_DIR",
         dest="feature_dirs",
         type=Path,
         required=True,
@@ -202,6 +202,7 @@ def make_argument_parser() -> argparse.ArgumentParser:
         "--target-file",
         metavar="PATH",
         type=Path,
+        required=True,
     )
 
     parser.add_argument(
