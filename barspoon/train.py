@@ -14,7 +14,8 @@ from torch.utils.data import DataLoader
 
 from barspoon.data import BagDataset
 from barspoon.model import LitEncDecTransformer
-from barspoon.utils import encode_targets, make_dataset_df, make_preds_df
+from barspoon.target_file import encode_targets
+from barspoon.utils import make_dataset_df, make_preds_df
 
 
 def main():

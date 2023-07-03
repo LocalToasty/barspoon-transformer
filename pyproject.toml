@@ -37,4 +37,4 @@ dependencies = [
 "barspoon-deploy" = "barspoon.deploy:main"
 "barspoon-crossval" = "barspoon.crossval:main"
 "barspoon-heatmaps" = "barspoon.heatmaps:main"
-"barspoon-gen-target-file" = "barspoon.gen_target_file:main"
+"barspoon-gen-target-file" = "barspoon.target_file:main"

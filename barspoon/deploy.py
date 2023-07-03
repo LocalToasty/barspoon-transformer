@@ -51,7 +51,7 @@ def main():
         predictions=predictions,
         base_df=dataset_df.drop(columns="path"),
         target_labels=target_labels,
-        categories=model.categories,
+        categories=model.hparams["categories"],
     )
 
     # save results
