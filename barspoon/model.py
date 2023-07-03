@@ -1,7 +1,7 @@
 import math
 import re
 from collections.abc import Sequence
-from typing import Any, Literal, Optional, Sequence, Tuple
+from typing import Any, Tuple
 
 import numpy as np
 import pytorch_lightning as pl
@@ -15,7 +15,6 @@ from torchmetrics.utilities.data import dim_zero_cat, select_topk
 __all__ = [
     "LitEncDecTransformer",
     "EncDecTransformer",
-    "ParallelLinear",
     "LitMilClassificaionMixin",
     "TopKMuliLabelAUROC",
 ]
@@ -50,7 +49,7 @@ class EncDecTransformer(nn.Module):
     def __init__(
         self,
         d_features: int,
-        n_targets: int,
+        n_outs: Sequence[int],
         *,
         d_model: int = 512,
         num_encoder_heads: int = 8,
@@ -60,6 +59,7 @@ class EncDecTransformer(nn.Module):
         dim_feedforward: int = 2048,
     ) -> None:
         super().__init__()
+        n_targets = len(n_outs)
 
         # one class token per output class
         self.class_tokens = nn.Parameter(torch.rand(n_targets, d_model))
@@ -87,8 +87,8 @@ class EncDecTransformer(nn.Module):
             decoder_layer, num_layers=num_decoder_layers
         )
 
-        self.heads = ParallelLinear(
-            in_features=d_model, out_features=1, n_parallel=n_targets
+        self.heads = nn.ModuleList(
+            [nn.Linear(in_features=d_model, out_features=n_out) for n_out in n_outs]
         )
 
     def forward(self, tile_tokens):
@@ -100,49 +100,18 @@ class EncDecTransformer(nn.Module):
         class_tokens = self.class_tokens.expand(batch_size, -1, -1)
         class_tokens = self.transformer_decoder(tgt=class_tokens, memory=tile_tokens)
 
-        # apply the corresponding head to each class token
-        logits = self.heads(class_tokens).squeeze(-1)
+        # Apply the corresponding head to each class token
+        logits = [
+            head(class_token)
+            for head, class_token in zip(
+                self.heads,
+                class_tokens.permute(1, 0, 2),  # Permute to [target, batch, d_model]
+                strict=True,
+            )
+        ]
+        logits = torch.cat(logits, dim=-1)
 
         return logits
-
-
-class ParallelLinear(nn.Module):
-    """Parallelly applies multiple linear layers.
-
-    For an input of shape (N, F) or (B, N, F), this layer applies a separate
-    linear layer to each of the N channels of the input.
-    """
-
-    def __init__(self, in_features: int, out_features: int, n_parallel: int):
-        super().__init__()
-        self.in_features, self.out_features, self.n_parallel = (
-            in_features,
-            out_features,
-            n_parallel,
-        )
-        self.weight = nn.Parameter(torch.empty((n_parallel, in_features, out_features)))
-        self.bias = nn.Parameter(torch.empty((n_parallel, out_features)))
-        self.reset_parameters()
-
-    def reset_parameters(self) -> None:
-        # Adapted from torch.nn.Linear
-        # Setting a=sqrt(5) in kaiming_uniform is the same as initializing with
-        # uniform(-1/sqrt(in_features), 1/sqrt(in_features)). For details, see
-        # https://github.com/pytorch/pytorch/issues/57109
-        torch.nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
-        if self.bias is not None:
-            bound = 1 / math.sqrt(self.out_features)
-            torch.nn.init.uniform_(self.bias, -bound, bound)
-
-    def forward(self, x: torch.Tensor):
-        assert x.ndim in [2, 3], (
-            "ParallelLinear is only defined for inputs of shape "
-            "(n_parallel, in_features) and (batch_size, n_parallel, in_features)"
-        )
-        return (x.unsqueeze(-2) @ self.weight).squeeze(-2) + self.bias
-
-    def extra_repr(self) -> str:
-        return f"in_features={self.in_features}, out_features={self.out_features}, n_parallel={self.n_parallel}"
 
 
 class LitMilClassificationMixin(pl.LightningModule):
@@ -311,7 +280,7 @@ class LitEncDecTransformer(LitMilClassificationMixin):
 
         self.model = EncDecTransformer(
             d_features=d_features,
-            n_targets=sum(len(w) for w in weights),
+            n_outs=[len(w) for w in weights],
             d_model=d_model,
             num_encoder_heads=num_encoder_heads,
             num_decoder_heads=num_decoder_heads,

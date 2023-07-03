@@ -119,41 +119,18 @@ def read_table(table: Union[Path, pd.DataFrame], dtype=str) -> pd.DataFrame:
 def make_preds_df(
     predictions: torch.Tensor,
     *,
-    weights: List[torch.Tensor],
     base_df: pd.DataFrame,
     target_labels: Sequence[str],
-    # From targets file #TODO don't use target file here
-    version: str = "barspoon-targets 1.0",
-    targets: Dict[str, Any],
-    **ignored,
+    categories: Sequence[str],
 ) -> pd.DataFrame:
-    # Make sure target file has the right version
-    name, version = version.split(" ")
-    assert name == "barspoon-targets"
-    version = Version(version)
-    assert version >= Version("1.0-pre1") and version < Version("2.0")
+    assert len(target_labels) == len(categories)
 
-    # Warn user of unused labels
-    if ignored:
-        logging.warn(f"ignored labels in target {target_label}: {ignored}")
-
-    target_edges = np.cumsum([0, *(len(w) for w in weights)])
+    target_edges = np.cumsum([0, *(len(c) for c in categories)])
 
     target_pred_dfs = []
-    for target_label, left, right in zip(
-        target_labels, target_edges[:-1], target_edges[1:]
+    for target_label, cat_labels, left, right in zip(
+        target_labels, categories, target_edges[:-1], target_edges[1:]
     ):
-        target_info = targets[target_label]
-        if (categories := target_info.get("categories")) is not None:
-            cat_labels = [c[0] for c in categories]
-        elif (thresholds := target_info.get("thresholds")) is not None:
-            cat_labels = [
-                f"[{l:+1.2e};{u:+1.2e})"
-                for l, u in zip(thresholds[:-1], thresholds[1:])
-            ]
-        else:
-            raise ValueError()  # TODO
-
         target_pred_df = pd.DataFrame(
             predictions[:, left:right],
             columns=[f"{target_label}_{cat}" for cat in cat_labels],
@@ -184,45 +161,47 @@ def note_problem(msg, mode: Literal["raise", "warn", "ignore"]):
 def encode_targets(
     clini_df: pd.DataFrame,
     *,
-    target_labels: Optional[Iterable[str]] = None,
+    target_labels: Iterable[str],
     # From targets toml
     version: str = "barspoon-targets 1.0",
     targets: Dict[str, Any],
     **ignored,
-) -> Tuple[List[str], torch.Tensor, torch.Tensor]:
+) -> Tuple[torch.Tensor, List[str], torch.Tensor]:
     """Encodes the information in a clini table into a tensor
 
     Returns:
         A tuple consisting of
-         1. A list of target labels
-         2. The encoded targets
+         1. The encoded targets
+         2. The categories' representative  #TODO elaborate
          3. A list of the targets' classes' weights
     """
     # Make sure target file has the right version
     name, version = version.split(" ")
     assert name == "barspoon-targets"
     version = Version(version)
-    assert version >= Version("1.0-pre1") and version < Version("2.0")
+    # assert version >= Version("1.0") and version < Version("2.0")
+    assert version == Version("1.0-pre1")
 
     if ignored:
         logging.warn(f"ignored {ignored}")
 
-    target_labels = list(target_labels or targets)
-    encoded_cols, weights = [], []
+    all_representatives, encoded_cols, weights = [], [], []
     for target_label in target_labels:
         info = targets[target_label]
 
         if "categories" in info:
-            encoded, weight = encode_category(
+            representatives, encoded, weight = encode_category(
                 clini_df=clini_df, target_label=target_label, **info
             )
+            all_representatives.append(representatives)
             encoded_cols.append(encoded)
             weights.append(weight)
 
         elif "thresholds" in info:
-            encoded, weight = encode_quantize(
+            representatives, encoded, weight = encode_quantize(
                 clini_df=clini_df, target_label=target_label, **info
             )
+            all_representatives.append(representatives)
             encoded_cols.append(encoded)
             weights.append(weight)
 
@@ -230,17 +209,17 @@ def encode_targets(
             logging.warn(f"ignoring unrecognized target type {target_label}")
 
     assert len(encoded_cols) == len(weights)
-    return target_labels, torch.cat(encoded_cols, dim=1), weights
+    return torch.cat(encoded_cols, dim=1), all_representatives, weights
 
 
 def encode_category(
     *,
     clini_df: pd.DataFrame,
     target_label: str,
-    categories: List[List[str]],
+    categories: Sequence[List[str]],
     class_weights: Optional[Dict[str, float]] = None,
     **ignored,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> Tuple[List[str], torch.Tensor, torch.Tensor]:
     # Map each category to its index
     category_map = {member: idx for idx, cat in enumerate(categories) for member in cat}
 
@@ -264,7 +243,7 @@ def encode_category(
     if ignored:
         logging.warn(f"ignored labels in target {target_label}: {ignored}")
 
-    return one_hot, weight
+    return [c[0] for c in categories], one_hot, weight
 
 
 def encode_quantize(
@@ -274,7 +253,7 @@ def encode_quantize(
     thresholds: List[float],
     class_weights: Optional[Dict[str, float]] = None,
     **ignored,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> Tuple[torch.Tensor, torch.Tensor, List[str]]:
     # Warn user of unused labels
     if ignored:
         logging.warn(f"ignored labels in target {target_label}: {ignored}")
@@ -286,24 +265,24 @@ def encode_quantize(
     # Count the number of left bounds of bins each item is greater or equal than
     # This will lead to nans being mapped to 0,
     # whereas each other classes will be set to C+1
-    bin_index = (numeric_vals >= thresholds.view(1, -1)).count_nonzero(dim=1)
+    bin_index = (numeric_vals >= torch.tensor(thresholds).view(1, -1)).count_nonzero(
+        dim=1
+    )
     # One hot encode and discard nan columns (first and last col)
     # This also maps all classes from C+1 back to C
     one_hot = F.one_hot(bin_index, num_classes=n_bins + 2)[:, 1:-1]
 
     # Class weights
+    categories = [
+        f"[{l:+1.2e};{u:+1.2e})" for l, u in zip(thresholds[:-1], thresholds[1:])
+    ]
     if class_weights is not None:
-        weight = torch.tensor(
-            [
-                class_weights[f"[{l:+1.2e};{u:+1.2e})"]
-                for l, u in zip(thresholds[:-1], thresholds[1:])
-            ]
-        )
+        weight = torch.tensor([class_weights[c] for c in categories])
     else:
         # No class weights given; use 1/#bins
         weight = torch.tensor([1 / n_bins] * n_bins)
 
-    return one_hot, weight
+    return categories, one_hot, weight
 
 
 def decode_targets(
@@ -317,11 +296,12 @@ def decode_targets(
     name, version = version.split(" ")
     assert name == "barspoon-targets"
     version = Version(version)
-    assert version >= Version("1.0-pre1") and version < Version("2.0")
+    # assert version >= Version("1.0") and version < Version("2.0")
+    assert version == Version("1.0-pre1")
 
     # Warn user of unused labels
     if ignored:
-        logging.warn(f"ignored labels in target {target_label}: {ignored}")
+        logging.warn(f"ignored parameters: {ignored}")
 
     decoded_targets = []
     curr_col = 0

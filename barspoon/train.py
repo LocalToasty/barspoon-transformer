@@ -62,17 +62,17 @@ def main():
         train_items, valid_items = train_test_split(dataset_df.index, test_size=0.2)
         train_df, valid_df = dataset_df.loc[train_items], dataset_df.loc[valid_items]
 
-    target_labels, train_encoded_targets, weights = encode_targets(
-        train_df, **target_info
+    train_encoded_targets, representatives, weights = encode_targets(
+        train_df, target_labels=target_labels, **target_info
     )
 
-    _, valid_encoded_targets, _ = encode_targets(
+    valid_encoded_targets, _, _ = encode_targets(
         valid_df, target_labels=target_labels, **target_info
     )
 
     assert not (
         overlap := set(train_df.index) & set(valid_df.index)
-    ), f"overlap between training and testing set: {overlap}"
+    ), f"unexpected overlap between training and testing set: {overlap}"
 
     train_dl, valid_dl = make_dataloaders(
         train_bags=train_df.path.values,
@@ -91,7 +91,9 @@ def main():
         d_features=d_features,
         target_labels=target_labels,
         weights=weights,
-        # other hparams
+        # Other hparams
+        version="barspoon-transformer 1.0-pre1",
+        categories=representatives,
         target_file=target_info,
         **{
             f"train_{train_df.index.name}": list(train_df.index),
@@ -122,10 +124,9 @@ def main():
     predictions = torch.cat(trainer.predict(model=model, dataloaders=valid_dl, return_predictions=True))  # type: ignore
     preds_df = make_preds_df(
         predictions=predictions,
-        weights=model.weights,
         base_df=valid_df,
         target_labels=target_labels,
-        **target_info,
+        categories=representatives,
     )
     preds_df.to_csv(args.output_dir / "valid-patient-preds.csv")
 

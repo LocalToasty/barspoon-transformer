@@ -49,10 +49,9 @@ def main():
     predictions = torch.cat(trainer.predict(model=model, dataloaders=dl))  # type: ignore
     preds_df = make_preds_df(
         predictions=predictions,
-        weights=model.weights,
         base_df=dataset_df.drop(columns="path"),
         target_labels=target_labels,
-        **model.hparams["target_file"],
+        categories=model.categories,
     )
 
     # save results

@@ -7,7 +7,6 @@ from typing import Any, Iterable, Iterator, Sequence, Tuple
 
 import numpy as np
 import numpy.typing as npt
-import pandas as pd
 import pytorch_lightning as pl
 import torch
 from pytorch_lightning.callbacks import EarlyStopping, ModelCheckpoint
@@ -56,15 +55,15 @@ def main():
             overlap := set(train_df.index) & set(valid_df.index)
         ), f"overlap between training and testing set: {overlap}"
 
-        target_labels, train_encoded_targets, weights = encode_targets(
+        target_labels, categories, train_encoded_targets, weights = encode_targets(
             train_df, **target_info
         )
 
-        _, valid_encoded_targets, _ = encode_targets(
+        _, _, valid_encoded_targets, _ = encode_targets(
             valid_df, target_labels=target_labels, **target_info
         )
 
-        _, test_encoded_targets, _ = encode_targets(
+        _, _, test_encoded_targets, _ = encode_targets(
             test_df, target_labels=target_labels, **target_info
         )
 
@@ -88,26 +87,29 @@ def main():
             target_labels=target_labels,
             weights=weights,
             # other hparams
+            version="barspoon-transformer 1.0-pre1",
+            categories=categories,
+            target_file=target_info,
             **{
                 f"train_{train_df.index.name}": list(train_df.index),
                 f"valid_{valid_df.index.name}": list(valid_df.index),
                 f"test_{test_df.index.name}": list(test_df.index),
             },
-            **{k: v for k, v in vars(args).items() if k not in {"target_labels"}},
+            **{k: v for k, v in vars(args).items() if k not in {"target_file"}},
         )
 
         trainer = pl.Trainer(
             default_root_dir=fold_dir,
             callbacks=[
                 EarlyStopping(
-                    monitor="val_TopKMultilabelAUROC",
-                    mode="max",
+                    monitor="val_loss",
+                    mode="min",
                     patience=args.patience,
                 ),
                 ModelCheckpoint(
-                    monitor="val_TopKMultilabelAUROC",
-                    mode="max",
-                    filename="checkpoint-{epoch:02d}-{val_TopKMultilabelAUROC:0.3f}",
+                    monitor="val_loss",
+                    mode="min",
+                    filename="checkpoint-{epoch:02d}-{val_loss:0.3f}",
                 ),
             ],
             max_epochs=args.max_epochs,
@@ -123,10 +125,9 @@ def main():
         valid_preds = torch.cat(trainer.predict(model=model, dataloaders=valid_dl, return_predictions=True))  # type: ignore
         valid_preds_df = make_preds_df(
             predictions=valid_preds,
-            weigths=model.weights,
             base_df=valid_df,
             target_labels=target_labels,
-            **target_info,
+            categories=categories,
         )
         valid_preds_df.to_csv(fold_dir / "valid-patient-preds.csv")
 
@@ -134,10 +135,9 @@ def main():
         test_preds = torch.cat(trainer.predict(model=model, dataloaders=test_dl, return_predictions=True))  # type: ignore
         test_preds_df = make_preds_df(
             predictions=test_preds,
-            weigths=model.weights,
             base_df=test_df,
             target_labels=target_labels,
-            **target_info,
+            categories=categories,
         )
         test_preds_df.to_csv(fold_dir / "patient-preds.csv")
 
@@ -243,7 +243,7 @@ def get_splits(
     items: npt.NDArray[Any], n_splits: int = 6
 ) -> Iterator[Tuple[npt.NDArray[Any], npt.NDArray[Any], npt.NDArray[Any]]]:
     splitter = KFold(n_splits=n_splits, shuffle=True)
-    folds = np.array([fold for _, fold in splitter.split(items)], dtype=int)
+    folds = np.array([fold for _, fold in splitter.split(items)], dtype=np.object_)
     for test_fold, test_fold_idxs in enumerate(folds):
         val_fold = (test_fold + 1) % n_splits
         val_fold_idxs = folds[val_fold]
