@@ -5,8 +5,8 @@ import h5py
 import matplotlib.pyplot as plt
 import numpy as np
 import numpy.typing as npt
-import pytorch_lightning as pl
 import torch
+from packaging.specifiers import Specifier
 from PIL import Image
 from PIL.PngImagePlugin import PngInfo
 from tqdm import tqdm
@@ -19,12 +19,18 @@ def main():
     parser = make_argument_parser()
     args = parser.parse_args()
 
-    pl.seed_everything(0)
-    torch.set_float32_matmul_precision("medium")
-
     model = LitEncDecTransformer.load_from_checkpoint(
         checkpoint_path=args.checkpoint_path
     ).to(torch.bfloat16)
+    name, version = model.hparams["version"].split(" ")
+    if not (
+        name == "barspoon-transformer"
+        and (spec := Specifier("~=1.0")).contains(version)
+    ):
+        raise ValueError(
+            f"model not compatible with barspoon-transformer {spec}",
+            model.hparams["version"],
+        )
 
     target_labels = model.hparams["target_labels"]
 
@@ -42,10 +48,10 @@ def main():
     for slides in tqdm(dataset_df.path):
         assert (
             len(slides) == 1
-        ), "we have grouped by filename, so there should only be one slide per item"
+        ), "there should only be one slide per item after grouping by slidename"
         h5_path = slides[0]
 
-        # load features
+        # Load features
         with h5py.File(h5_path) as h5_file:
             feats = h5_file["feats"][:]
             coords = h5_file["coords"][:]
@@ -57,43 +63,54 @@ def main():
 
         mask = (att_maps > 0).any(axis=0)
 
-        # save all the heatmaps
+        categories = model.hparams["categories"]
+        target_edges = np.cumsum([0, *(len(c) for c in categories)])
+
+        # Save all the heatmaps
         (outdir := args.output_dir / h5_path.stem).mkdir(exist_ok=True, parents=True)
-        for i, target_label in enumerate(target_labels):
-            # save metadata in slide
-            att_im = plt.get_cmap("magma")(att_maps[i] / att_maps.max())
-            att_im[:, :, -1] = mask
-            Image.fromarray(
-                np.uint8(255 * att_im),
-                "RGBA",
-            ).save(
-                outdir / f"attention_{target_label}.png",
-                pnginfo=make_metadata(
-                    # metadata format semver
-                    # update minor version when adding fields,
-                    # major when removing fields / changing semantics
-                    version="barspoon-attention 0.1",
-                    filename=h5_path.stem,
-                    stride=str(stride),
-                    target_label=target_label,
-                    attention_scale=f"{att_maps.max():e}",
-                ),
-            )
+        for target_label, cs, left in zip(
+            target_labels,
+            categories,
+            target_edges[:-1],
+            strict=True,
+        ):
+            for i, category in enumerate(cs):
+                # Save metadata in slide
+                att_im = plt.get_cmap("magma")(att_maps[left + i] / att_maps.max())
+                att_im[:, :, -1] = mask
+                Image.fromarray(
+                    np.uint8(255 * att_im),
+                    "RGBA",
+                ).save(
+                    outdir / f"attention_{target_label}_{category}.png",
+                    pnginfo=make_metadata(
+                        # metadata format semver
+                        # update minor version when adding fields,
+                        # major when removing fields / changing semantics
+                        version="barspoon-attention 1.0",
+                        filename=h5_path.stem,
+                        stride=str(stride),
+                        target_label=target_label,
+                        category=category,
+                        attention_scale=f"{att_maps.max():e}",
+                    ),
+                )
 
-            # use scores as color, attention as alpha
-            im = plt.get_cmap("coolwarm")(score_maps[i])
-            im[:, :, -1] = att_maps[i] / att_maps[i].max()
+                # use scores as color, attention as alpha
+                im = plt.get_cmap("coolwarm")(score_maps[left + i])
+                im[:, :, -1] = att_maps[left + i] / att_maps[left + i].max()
 
-            Image.fromarray(np.uint8(255 * im), "RGBA").save(
-                outdir / f"map_{target_label}.png",
-                pnginfo=make_metadata(
-                    version="barspoon-map 0.1",  # see above
-                    filename=h5_path.stem,
-                    stride=str(stride),
-                    target_label=target_label,
-                    attention_scale=f"{att_maps[i].max():e}",
-                ),
-            )
+                Image.fromarray(np.uint8(255 * im), "RGBA").save(
+                    outdir / f"map_{target_label}_{category}.png",
+                    pnginfo=make_metadata(
+                        version="barspoon-map 1.0",  # see above
+                        filename=h5_path.stem,
+                        stride=str(stride),
+                        target_label=target_label,
+                        category=category,
+                        attention_scale=f"{att_maps[left+i].max():e}",
+                    ),
+                )
 
 
 def compute_attention_maps(
@@ -104,7 +121,7 @@ def compute_attention_maps(
     Returns:
         An array of shape [n_dim, x, y]
     """
-    n_targs = len(model.hparams["target_labels"])
+    n_outs = sum(len(w) for w in model.weights)
     atts = []
     feats_t = (
         torch.tensor(feats)
@@ -113,8 +130,9 @@ def compute_attention_maps(
         .repeat(batch_size, 1, 1)
         .cuda()
     )
-    for idx in range(0, n_targs, batch_size):
-        feats_t = feats_t.detach()  # zero grads of input features
+    model = model.eval()
+    for idx in range(0, n_outs, batch_size):
+        feats_t = feats_t.detach()  # Zero grads of input features
         feats_t.requires_grad = True
         model.zero_grad()
         scores = model(feats_t).sigmoid()
@@ -123,7 +141,10 @@ def compute_attention_maps(
         gradcam = (feats_t.grad * feats_t).abs().sum(-1)
         atts.append(gradcam.detach().cpu())
 
-    atts = torch.cat(atts)[:n_targs]
+    # If n_outs isn't divisible by batch_size,
+    # we'll have some superfluous output maps
+    # Drop them
+    atts = torch.cat(atts)[:n_outs]
     return vals_to_im(atts.permute(1, 0), coords, stride)
 
 
@@ -133,6 +154,7 @@ def compute_score_maps(model, feats, coords, stride):
     Returns:
         An array of shape [n_dim, x, y]
     """
+    model = model.eval()
     with torch.no_grad():
         feats_t = torch.tensor(feats).to(torch.bfloat16).unsqueeze(1).cuda()
         scores = model(feats_t).sigmoid().detach().cpu()
@@ -162,7 +184,6 @@ def make_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "-o",
         "--output-dir",
-        metavar="PATH",
         type=Path,
         required=True,
         help="Directory path for the output",
@@ -171,7 +192,7 @@ def make_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "-c",
         "--clini-table",
-        metavar="PATH",
+        metavar="CLINI_TABLE",
         dest="clini_tables",
         type=Path,
         action="append",
@@ -180,7 +201,7 @@ def make_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "-s",
         "--slide-table",
-        metavar="PATH",
+        metavar="SLIDE_TABLE",
         dest="slide_tables",
         type=Path,
         action="append",
@@ -189,7 +210,7 @@ def make_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "-f",
         "--feature-dir",
-        metavar="PATH",
+        metavar="FEATURE_DIR",
         dest="feature_dirs",
         type=Path,
         required=True,
@@ -200,7 +221,6 @@ def make_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "-m",
         "--checkpoint-path",
-        metavar="PATH",
         type=Path,
         required=True,
         help="Path to the checkpoint file",
