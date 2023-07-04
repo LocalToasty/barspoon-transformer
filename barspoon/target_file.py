@@ -9,7 +9,7 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn.functional as F
-from packaging.version import Version
+from packaging.specifiers import Specifier
 
 from barspoon.utils import read_table
 
@@ -35,10 +35,10 @@ def encode_targets(
     """
     # Make sure target file has the right version
     name, version = version.split(" ")
-    assert name == "barspoon-targets"
-    version = Version(version)
-    # assert version >= Version("1.0") and version < Version("2.0")
-    assert version == Version("1.0-pre1")
+    if not (
+        name == "barspoon-targets" and (spec := Specifier("~=1.0")).contains(version)
+    ):
+        raise ValueError(f"model not compatible with barspoon-targets {spec}", version)
 
     if ignored:
         logging.warn(f"ignored {ignored}")
@@ -152,10 +152,10 @@ def decode_targets(
     **ignored,
 ) -> List[np.array]:
     name, version = version.split(" ")
-    assert name == "barspoon-targets"
-    version = Version(version)
-    # assert version >= Version("1.0") and version < Version("2.0")
-    assert version == Version("1.0-pre1")
+    if not (
+        name == "barspoon-targets" and (spec := Specifier("~=1.0")).contains(version)
+    ):
+        raise ValueError(f"model not compatible with barspoon-targets {spec}", version)
 
     # Warn user of unused labels
     if ignored:
@@ -260,7 +260,7 @@ def main():
     clini_df = pd.concat([read_table(c) for c in args.clini_tables])
 
     # Artifact name and version (follows semantic versioning)
-    outtoml.write('version = "barspoon-targets 1.0-pre1"\n\n')
+    outtoml.write('version = "barspoon-targets 1.0"\n\n')
 
     # Translation table to escape basic strings in TOML
     escape_table = str.maketrans(

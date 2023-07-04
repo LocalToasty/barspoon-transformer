@@ -93,7 +93,7 @@ def main():
         target_labels=target_labels,
         weights=weights,
         # Other hparams
-        version="barspoon-transformer 1.0-pre1",
+        version="barspoon-transformer 1.0",
         categories=representatives,
         target_file=target_info,
         **{
