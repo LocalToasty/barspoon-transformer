@@ -1,4 +1,5 @@
 import argparse
+import logging
 from pathlib import Path
 
 import h5py
@@ -58,7 +59,14 @@ def main():
             xs = np.sort(np.unique(coords[:, 0]))
             stride = np.min(xs[1:] - xs[:-1])
 
-        gradcams = compute_attention_maps(model, feats, coords, stride, args.batch_size)
+        try:
+            gradcams = compute_attention_maps(
+                model, feats, coords, stride, args.batch_size
+            )
+        except Exception as exception:
+            logging.error(f"error while processing {slides[0]}: {exception})")
+            continue
+
         mask = (gradcams > 0).any(axis=0)
 
         categories = model.hparams["categories"]
