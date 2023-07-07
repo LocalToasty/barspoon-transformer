@@ -36,7 +36,9 @@ class BagDataset(Dataset):
         return len(self.bags)
 
     def __getitem__(self, index: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        # collect all the features
+        """Returns features, targets"""
+
+        # Collect features from all requested slides
         feat_list = []
         for bag_file in self.bags[index]:
             with h5py.File(bag_file, "r") as f:
@@ -53,20 +55,22 @@ class BagDataset(Dataset):
         feats = torch.concat(feat_list).float()
 
         if self.instances_per_bag is not None:
-            feats = pad_or_sample(feats, 4096, deterministic=self.deterministic)
+            feats = pad_or_sample(
+                feats, self.instances_per_bag, deterministic=self.deterministic
+            )
 
         return feats, self.targets[index]
 
 
 def pad_or_sample(a: torch.Tensor, n: int, deterministic: bool):
     if a.size(0) <= n:
-        # too few features; pad with zeros
+        # Too few features; pad with zeros
         pad_size = n - a.size(0)
         return torch.cat([a, torch.zeros(pad_size, *a.shape[1:])])
     elif deterministic:
-        # sample equidistantly
+        # Sample equidistantly
         return a[torch.linspace(0, len(a) - 1, steps=n, dtype=torch.int)]
     else:
-        # sample randomly
+        # Sample randomly
         idx = torch.randperm(a.size(0))[:n]
         return a[idx]
