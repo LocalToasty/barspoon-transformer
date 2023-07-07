@@ -194,6 +194,7 @@ def make_argument_parser() -> argparse.ArgumentParser:
         "--patient-col",
         metavar="COL",
         type=str,
+        default="patient",
         help="Name of the patient column",
     )
     parser.add_argument(
