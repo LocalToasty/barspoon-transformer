@@ -32,6 +32,14 @@ class BagDataset(Dataset):
     bag.  Otherwise, they will be sampled randomly.
     """
 
+    extractor: Optional[str] = None
+    """Feature extractor the features got extracted with
+
+    Set on first encountered feature, if not set manually.  Will raise an error
+    during runtime if features extracted with different feature extractors are
+    encountered in the dataset.
+    """
+
     def __len__(self):
         return len(self.bags)
 
@@ -42,6 +50,16 @@ class BagDataset(Dataset):
         feat_list = []
         for bag_file in self.bags[index]:
             with h5py.File(bag_file, "r") as f:
+                # Ensure all features are created with the same feature extractor
+                this_slides_extractor = f.attrs.get("extractor")
+                if self.extractor is None:
+                    self.extractor = this_slides_extractor
+                assert this_slides_extractor == self.extractor, (
+                    "all features have to be extracted with the same feature extractor! "
+                    f"{bag_file} has been extracted with {this_slides_extractor}, "
+                    f"expected {self.extractor}"
+                )
+
                 feat_list.append(
                     torch.from_numpy(f["feats"][:])
                     if self.instances_per_bag is None
@@ -51,8 +69,7 @@ class BagDataset(Dataset):
                         deterministic=self.deterministic,
                     )
                 )
-
-        feats = torch.concat(feat_list).float()
+        feats = torch.concat(feat_list)
 
         if self.instances_per_bag is not None:
             feats = pad_or_sample(
