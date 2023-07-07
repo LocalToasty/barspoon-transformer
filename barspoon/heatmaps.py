@@ -131,7 +131,7 @@ def main():
             strict=True,
         ):
             gradcam_im = plt.get_cmap("magma")(
-                abs(gradcams[left]) / abs(gradcams).max()
+                abs(gradcams[left:right]).mean(0) / abs(gradcams).max()
             )
             gradcam_im[:, :, -1] = mask
             Image.fromarray(
