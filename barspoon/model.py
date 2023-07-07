@@ -9,8 +9,7 @@ import torch
 import torch.nn.functional as F
 import torchmetrics
 from torch import Tensor, nn
-from torchmetrics.functional.classification.auroc import _multilabel_auroc_compute
-from torchmetrics.utilities.data import dim_zero_cat, select_topk
+from torchmetrics.utilities.data import dim_zero_cat
 
 __all__ = [
     "LitEncDecTransformer",
@@ -23,11 +22,14 @@ __all__ = [
 class EncDecTransformer(nn.Module):
     """An encoder decoder architecture for multilabel classification tasks
 
-    This architecture is a modified encoder decoder stack: First, we encode the
-    input tokens using an encoder stack.  We then decode these tokens using a
-    set of class tokens, one per output label.  Finally, we forward each of the
-    decoded tokens through a fully connected layer to get a label-wise
-    prediction.
+    This architecture is a modified version of the one found in [Attention Is
+    All You Need][1]: First, we project the features into a lower-dimensional
+    feature space, to prevent the transformer architecture's complexity from
+    exploding for high-dimensional features.  We then encode these projected
+    input tokens using a transformer encoder stack.  Next, we decode these
+    tokens using a set of class tokens, one per output label.  Finally, we
+    forward each of the decoded tokens through a fully connected layer to get a
+    label-wise prediction.
 
              +--+   +---+
         t1 --|FC|-->|   |--+
@@ -44,6 +46,31 @@ class EncDecTransformer(nn.Module):
          .               | k |   +---+     .
         ck ------------->|   |-->|FCk|--> sk
                          +---+   +---+
+
+    We opted for this architecture instead of a more traditional [Vision
+    Transformer][2] to improve performance for multi-label predictions with many
+    labels.  Our experiments have shown that adding too many class tokens to a
+    vision transformer decreases its performance, as the same weights have to
+    both process the tiles' information and the class token's processing.  Using
+    an encoder-decoder architecture alleviates these issues, as the data-flow of
+    the class tokens is completely independent of the encoding of the tiles.
+
+    The architecture _differs_ from the one descibed in [Attention Is All You
+    Need][1] as follows:
+
+     1. There is an initial projection stage to reduce the dimension of the
+        feature vectors and allow us to use the transformer with arbitrary
+        features.
+     2. Instead of the language translation task described in [Attention Is All
+        You Need][1], where the tokens of the words translated so far are used
+        to predict the next word in the sequence, we use a set of fixed, learned
+        class tokens in conjunction with equally as many independent fully
+        connected layers to predict multiple labels at once.
+
+    [1]: https://arxiv.org/abs/1706.03762 "Attention Is All You Need"
+    [2]: https://arxiv.org/abs/2010.11929
+        "An Image is Worth 16x16 Words:
+         Transformers for Image Recognition at Scale"
     """
 
     def __init__(
@@ -61,7 +88,7 @@ class EncDecTransformer(nn.Module):
         super().__init__()
         n_targets = len(n_outs)
 
-        # one class token per output class
+        # One class token per output label
         self.class_tokens = nn.Parameter(torch.rand(n_targets, d_model))
 
         self.projector = nn.Sequential(nn.Linear(d_features, d_model), nn.ReLU())
@@ -115,6 +142,8 @@ class EncDecTransformer(nn.Module):
 
 
 class LitMilClassificationMixin(pl.LightningModule):
+    """Makes a module into a multilabel, multiclass Lightning one"""
+
     def __init__(
         self,
         *,
@@ -164,7 +193,7 @@ class LitMilClassificationMixin(pl.LightningModule):
                 target_edges[:-1],  # Leftmost column belonging to target
                 target_edges[1:],  # Rightmost column belonging to target
                 self.weights,
-                # strict=True,  # Python 3.9 hates it
+                strict=True,
             )
         )
 
@@ -260,14 +289,14 @@ class LitEncDecTransformer(LitMilClassificationMixin):
         d_features: int,
         target_labels: Sequence[str],
         weights: Sequence[torch.Tensor],
-        # model parameters
+        # Model parameters
         d_model: int = 512,
         num_encoder_heads: int = 8,
         num_decoder_heads: int = 8,
         num_encoder_layers: int = 2,
         num_decoder_layers: int = 2,
         dim_feedforward: int = 2048,
-        # other hparams
+        # Other hparams
         learning_rate: float = 1e-4,
         **hparams: Any,
     ) -> None:
