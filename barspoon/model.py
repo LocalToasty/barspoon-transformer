@@ -25,27 +25,30 @@ class EncDecTransformer(nn.Module):
     This architecture is a modified version of the one found in [Attention Is
     All You Need][1]: First, we project the features into a lower-dimensional
     feature space, to prevent the transformer architecture's complexity from
-    exploding for high-dimensional features.  We then encode these projected
-    input tokens using a transformer encoder stack.  Next, we decode these
-    tokens using a set of class tokens, one per output label.  Finally, we
-    forward each of the decoded tokens through a fully connected layer to get a
-    label-wise prediction.
+    exploding for high-dimensional features.  We add sinusodial [positional
+    encodings][1].  We then encode these projected input tokens using a
+    transformer encoder stack.  Next, we decode these tokens using a set of
+    class tokens, one per output label.  Finally, we forward each of the decoded
+    tokens through a fully connected layer to get a label-wise prediction.
 
-             +--+   +---+
-        t1 --|FC|-->|   |--+
-         .   +--+   | E |  |
-         .          | x |  |
-         .   +--+   | n |  |
-        tn --|FC|-->|   |--+
-             +--+   +---+  |
-                           v
-                         +---+   +---+
-        c1 ------------->|   |-->|FC1|--> s1
-         .               | D |   +---+     .
-         .               | x |             .
-         .               | k |   +---+     .
-        ck ------------->|   |-->|FCk|--> sk
-                         +---+   +---+
+                  PE1
+                   |
+             +--+  v   +---+
+        t1 --|FC|--+-->|   |--+
+         .   +--+      | E |  |
+         .             | x |  |
+         .   +--+      | n |  |
+        tn --|FC|--+-->|   |--+
+             +--+  ^   +---+  |
+                   |          |
+                  PEn         v
+                            +---+   +---+
+        c1 ---------------->|   |-->|FC1|--> s1
+         .                  | D |   +---+     .
+         .                  | x |             .
+         .                  | k |   +---+     .
+        ck ---------------->|   |-->|FCk|--> sk
+                            +---+   +---+
 
     We opted for this architecture instead of a more traditional [Vision
     Transformer][2] to improve performance for multi-label predictions with many
@@ -54,6 +57,16 @@ class EncDecTransformer(nn.Module):
     both process the tiles' information and the class token's processing.  Using
     an encoder-decoder architecture alleviates these issues, as the data-flow of
     the class tokens is completely independent of the encoding of the tiles.
+
+    In our experiments so far we did not see any improvement by adding
+    positional encodings.  We tried
+     1. [Sinusodal encodings][1]
+     2. Adding absolute positions to the feature vector, scaled down so the
+        maximum value in the training dataset is 1.
+    Since neither reduced performance the author percieves the first one to be
+    more elegant (as it doesn't depend on the training set), we opted to keep
+    the positional encoding regardless in the hopes of it improving performance
+    on future tasks.
 
     The architecture _differs_ from the one descibed in [Attention Is All You
     Need][1] as follows:
@@ -118,10 +131,25 @@ class EncDecTransformer(nn.Module):
             [nn.Linear(in_features=d_model, out_features=n_out) for n_out in n_outs]
         )
 
-    def forward(self, tile_tokens):
+    def forward(self, tile_tokens, tile_positions):
         batch_size, _, _ = tile_tokens.shape
 
         tile_tokens = self.projector(tile_tokens)  # shape: [bs, seq_len, d_model]
+
+        # Add positional encodings
+        d_model = tile_tokens.size(-1)
+        x = tile_positions.unsqueeze(-1) / 100_000 ** (
+            torch.arange(d_model // 4).type_as(tile_positions) / d_model
+        )
+        positional_encodings = torch.cat(
+            [
+                torch.sin(x).flatten(start_dim=-2),
+                torch.cos(x).flatten(start_dim=-2),
+            ],
+            dim=-1,
+        )
+        tile_tokens = tile_tokens + positional_encodings
+
         tile_tokens = self.transformer_encoder(tile_tokens)
 
         class_tokens = self.class_tokens.expand(batch_size, -1, -1)
@@ -177,8 +205,8 @@ class LitMilClassificationMixin(pl.LightningModule):
         self.save_hyperparameters()
 
     def step(self, batch: Tuple[Tensor, Tensor], step_name=None):
-        bags, targets = batch
-        logits = self(bags)
+        feats, coords, targets = batch
+        logits = self(feats, coords)
 
         # The column ranges belonging to each target
         target_edges = np.cumsum([0, *(len(w) for w in self.weights)])
@@ -242,11 +270,11 @@ class LitMilClassificationMixin(pl.LightningModule):
         return self.step(batch, step_name="test")
 
     def predict_step(self, batch, batch_idx, dataloader_idx=0):
-        if isinstance(batch, Tensor):
-            bag = batch
+        if len(batch) == 2:
+            feats, positions = batch
         else:
-            bag, _ = batch
-        logits = self(bag)
+            feats, positions, _ = batch
+        logits = self(feats, positions)
 
         target_edges = np.cumsum([0, *(len(w) for w in self.weights)])
         softmaxed = torch.cat(
@@ -320,5 +348,5 @@ class LitEncDecTransformer(LitMilClassificationMixin):
 
         self.save_hyperparameters()
 
-    def forward(self, tile_tokens):
-        return self.model(tile_tokens)
+    def forward(self, *args):
+        return self.model(*args)

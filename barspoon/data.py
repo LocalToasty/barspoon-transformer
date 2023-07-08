@@ -1,7 +1,7 @@
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 import h5py
 import torch
@@ -43,11 +43,13 @@ class BagDataset(Dataset):
     def __len__(self):
         return len(self.bags)
 
-    def __getitem__(self, index: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Returns features, targets"""
+    def __getitem__(
+        self, index: int
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Returns features, positions, targets"""
 
         # Collect features from all requested slides
-        feat_list = []
+        feat_list, coord_list = [], []
         for bag_file in self.bags[index]:
             with h5py.File(bag_file, "r") as f:
                 # Ensure all features are created with the same feature extractor
@@ -60,34 +62,55 @@ class BagDataset(Dataset):
                     f"expected {self.extractor}"
                 )
 
-                feat_list.append(
-                    torch.from_numpy(f["feats"][:])
-                    if self.instances_per_bag is None
-                    else pad_or_sample(
-                        torch.from_numpy(f["feats"][:]),
-                        n=self.instances_per_bag,
-                        deterministic=self.deterministic,
-                    )
+                feats, coords = (
+                    torch.tensor(f["feats"][:]),
+                    torch.tensor(f["coords"][:]),
                 )
-        feats = torch.concat(feat_list).float()
 
+            if self.instances_per_bag:
+                feats, coords = pad_or_sample(
+                    feats,
+                    coords,
+                    n=self.instances_per_bag,
+                    deterministic=self.deterministic,
+                )
+
+            feat_list.append(feats.float())
+            coord_list.append(coords.float())
+
+        feats, coords = torch.concat(feat_list), torch.concat(coord_list)
+
+        # We sample both on the slide as well as on the bag level
+        # to ensure that each of the bags gets represented
+        # Otherwise, drastically larger bags could "drown out"
+        # the few instances of the smaller bags
         if self.instances_per_bag is not None:
-            feats = pad_or_sample(
-                feats, self.instances_per_bag, deterministic=self.deterministic
+            feats, coords = pad_or_sample(
+                feats,
+                coords,
+                n=self.instances_per_bag,
+                deterministic=self.deterministic,
             )
 
-        return feats, self.targets[index]
+        return feats, coords, self.targets[index]
 
 
-def pad_or_sample(a: torch.Tensor, n: int, deterministic: bool):
-    if a.size(0) <= n:
+def pad_or_sample(*xs: torch.Tensor, n: int, deterministic: bool) -> List[torch.Tensor]:
+    assert (
+        len(set(x.shape[0] for x in xs)) == 1
+    ), "all inputs have to be of equal length"
+    length = xs[0].shape[0]
+
+    if length <= n:
         # Too few features; pad with zeros
-        pad_size = n - a.size(0)
-        return torch.cat([a, torch.zeros(pad_size, *a.shape[1:])])
+        pad_size = n - length
+        padded = [torch.cat([x, torch.zeros(pad_size, *x.shape[1:])]) for x in xs]
+        return padded
     elif deterministic:
         # Sample equidistantly
-        return a[torch.linspace(0, len(a) - 1, steps=n, dtype=torch.int)]
+        idx = torch.linspace(0, len(xs) - 1, steps=n, dtype=torch.int)
+        return [x[idx] for x in xs]
     else:
         # Sample randomly
-        idx = torch.randperm(a.size(0))[:n]
-        return a[idx]
+        idx = torch.randperm(length)[:n]
+        return [x[idx] for x in xs]

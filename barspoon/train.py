@@ -85,7 +85,7 @@ def main():
         num_workers=args.num_workers,
     )
 
-    example_bags, _ = next(iter(train_dl))
+    example_bags, _, _ = next(iter(train_dl))
     d_features = example_bags.size(-1)
 
     model = LitEncDecTransformer(
@@ -93,7 +93,7 @@ def main():
         target_labels=target_labels,
         weights=weights,
         # Other hparams
-        version="barspoon-transformer 1.0",
+        version="barspoon-transformer 2.0",
         categories=representatives,
         target_file=target_info,
         **{
