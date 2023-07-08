@@ -69,7 +69,7 @@ class BagDataset(Dataset):
                         deterministic=self.deterministic,
                     )
                 )
-        feats = torch.concat(feat_list)
+        feats = torch.concat(feat_list).float()
 
         if self.instances_per_bag is not None:
             feats = pad_or_sample(

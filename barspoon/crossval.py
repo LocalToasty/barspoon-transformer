@@ -56,15 +56,15 @@ def main():
             overlap := set(train_df.index) & set(valid_df.index)
         ), f"overlap between training and testing set: {overlap}"
 
-        target_labels, categories, train_encoded_targets, weights = encode_targets(
-            train_df, **target_info
+        train_encoded_targets, representatives, weights = encode_targets(
+            train_df, target_labels=target_labels, **target_info
         )
 
-        _, _, valid_encoded_targets, _ = encode_targets(
+        valid_encoded_targets, _, _ = encode_targets(
             valid_df, target_labels=target_labels, **target_info
         )
 
-        _, _, test_encoded_targets, _ = encode_targets(
+        test_encoded_targets, _, _ = encode_targets(
             test_df, target_labels=target_labels, **target_info
         )
 
@@ -89,7 +89,7 @@ def main():
             weights=weights,
             # other hparams
             version="barspoon-transformer 1.0",
-            categories=categories,
+            categories=representatives,
             target_file=target_info,
             **{
                 f"train_{train_df.index.name}": list(train_df.index),
@@ -128,7 +128,7 @@ def main():
             predictions=valid_preds,
             base_df=valid_df,
             target_labels=target_labels,
-            categories=categories,
+            categories=representatives,
         )
         valid_preds_df.to_csv(fold_dir / "valid-patient-preds.csv")
 
@@ -138,7 +138,7 @@ def main():
             predictions=test_preds,
             base_df=test_df,
             target_labels=target_labels,
-            categories=categories,
+            categories=representatives,
         )
         test_preds_df.to_csv(fold_dir / "patient-preds.csv")
 
