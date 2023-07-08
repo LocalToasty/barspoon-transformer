@@ -122,6 +122,16 @@ def main():
 
     trainer.fit(model=model, train_dataloaders=train_dl, val_dataloaders=valid_dl)
 
+    # The new "deployment" trainer only uses one GPU, because `predict_step`
+    # does not return anything for some of the multi-GPU strategies
+    # (including the default one)
+    #TODO Maybe using another strat in the trainer would fix this?
+    trainer = pl.Trainer(
+        default_root_dir=args.output_dir,
+        accelerator="auto",
+        devices=1,
+    )
+
     predictions = torch.cat(trainer.predict(model=model, dataloaders=valid_dl, return_predictions=True))  # type: ignore
     preds_df = make_preds_df(
         predictions=predictions,
