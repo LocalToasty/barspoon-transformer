@@ -245,13 +245,19 @@ def get_splits(
     items: npt.NDArray[Any], n_splits: int = 6
 ) -> Iterator[Tuple[npt.NDArray[Any], npt.NDArray[Any], npt.NDArray[Any]]]:
     splitter = KFold(n_splits=n_splits, shuffle=True)
+    # We have to explicitly force `dtype=np.object_` so this doesn't fail for
+    # folds of different sizes
     folds = np.array([fold for _, fold in splitter.split(items)], dtype=np.object_)
     for test_fold, test_fold_idxs in enumerate(folds):
+        # We have to agressively do `astype()`s here, as, if all folds have the
+        # same size, the folds get coerced into one 2D tensor with dtype
+        # `object` instead of one with dtype int
+        test_fold_idxs = test_fold_idxs.astype(int)
         val_fold = (test_fold + 1) % n_splits
-        val_fold_idxs = folds[val_fold]
+        val_fold_idxs = folds[val_fold].astype(int)
 
         train_folds = set(range(n_splits)) - {test_fold, val_fold}
-        train_fold_idxs = np.concatenate(folds[list(train_folds)])
+        train_fold_idxs = np.concatenate(folds[list(train_folds)]).astype(int)
 
         yield (
             items[train_fold_idxs],
