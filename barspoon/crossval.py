@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 import argparse
 import os
 import tomllib
@@ -127,6 +126,8 @@ def main():
         )
 
         trainer.fit(model=model, train_dataloaders=train_dl, val_dataloaders=valid_dl)
+
+        trainer.test(model=model, dataloaders=test_dl)
 
         # Save best validation set predictions
         valid_preds = torch.cat(trainer.predict(model=model, dataloaders=valid_dl, return_predictions=True))  # type: ignore
