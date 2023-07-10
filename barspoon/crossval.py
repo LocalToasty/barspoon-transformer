@@ -194,6 +194,7 @@ def make_argument_parser() -> argparse.ArgumentParser:
         "--target-file",
         metavar="PATH",
         type=Path,
+        required=True,
     )
 
     parser.add_argument(
