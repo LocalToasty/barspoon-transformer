@@ -87,7 +87,7 @@ def main():
             d_features=d_features,
             target_labels=target_labels,
             weights=weights,
-            # other hparams
+            # Other hparams
             version="barspoon-transformer 1.0",
             categories=representatives,
             target_file=target_info,
@@ -99,6 +99,11 @@ def main():
             **{k: v for k, v in vars(args).items() if k not in {"target_file"}},
         )
 
+        # FIXME The number of accelerators is currently fixed to one for the
+        # following reasons:
+        #  1. `trainer.predict()` does not return any predictions if used with
+        #     the default strategy no multiple GPUs
+        #  2. `barspoon.model.SafeMulticlassAUROC` breaks on multiple GPUs.
         trainer = pl.Trainer(
             default_root_dir=fold_dir,
             callbacks=[
@@ -114,7 +119,8 @@ def main():
                 ),
             ],
             max_epochs=args.max_epochs,
-            accelerator="auto",
+            accelerator=args.accelerator,
+            devices=1,
             accumulate_grad_batches=args.accumulate_grad_samples // args.batch_size,
             gradient_clip_val=0.5,
             logger=CSVLogger(save_dir=fold_dir),
@@ -122,15 +128,6 @@ def main():
 
         trainer.fit(model=model, train_dataloaders=train_dl, val_dataloaders=valid_dl)
 
-        # The new "deployment" trainer only uses one GPU, because `predict_step`
-        # does not return anything for some of the multi-GPU strategies
-        # (including the default one)
-        #TODO Maybe using another strat in the trainer would fix this?
-        trainer = pl.Trainer(
-            default_root_dir=args.output_dir,
-            accelerator="auto",
-            devices=1,
-        )
         # Save best validation set predictions
         valid_preds = torch.cat(trainer.predict(model=model, dataloaders=valid_dl, return_predictions=True))  # type: ignore
         valid_preds_df = make_preds_df(
@@ -246,6 +243,7 @@ def make_argument_parser() -> argparse.ArgumentParser:
         default=6,
         help="Number of splits during cross-validation",
     )
+    parser.add_argument("--accelerator", type=str, default="auto")
 
     return parser
 

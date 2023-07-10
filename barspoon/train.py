@@ -114,23 +114,19 @@ def main():
             ),
         ],
         max_epochs=args.max_epochs,
-        accelerator="auto",
+        # FIXME The number of accelerators is currently fixed to one for the
+        # following reasons:
+        #  1. `trainer.predict()` does not return any predictions if used with
+        #     the default strategy no multiple GPUs
+        #  2. `barspoon.model.SafeMulticlassAUROC` breaks on multiple GPUs.
+        accelerator=args.accelerator,
+        devices=1,
         accumulate_grad_batches=args.accumulate_grad_samples // args.batch_size,
         gradient_clip_val=0.5,
         logger=CSVLogger(save_dir=args.output_dir),
     )
 
     trainer.fit(model=model, train_dataloaders=train_dl, val_dataloaders=valid_dl)
-
-    # The new "deployment" trainer only uses one GPU, because `predict_step`
-    # does not return anything for some of the multi-GPU strategies
-    # (including the default one)
-    #TODO Maybe using another strat in the trainer would fix this?
-    trainer = pl.Trainer(
-        default_root_dir=args.output_dir,
-        accelerator="auto",
-        devices=1,
-    )
 
     predictions = torch.cat(trainer.predict(model=model, dataloaders=valid_dl, return_predictions=True))  # type: ignore
     preds_df = make_preds_df(
@@ -257,6 +253,7 @@ def make_argument_parser() -> argparse.ArgumentParser:
     training_parser.add_argument("--patience", type=int, default=16)
     training_parser.add_argument("--max-epochs", type=int, default=256)
     training_parser.add_argument("--seed", type=int, default=0)
+    training_parser.add_argument("--accelerator", type=str, default="auto")
 
     return parser
 

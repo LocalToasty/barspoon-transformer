@@ -212,7 +212,7 @@ class LitMilClassificationMixin(pl.LightningModule):
                 self.target_labels,
                 target_edges[:-1],
                 target_edges[1:],
-                # strict=True,  # Python 3.9 hates it
+                strict=True,
             ):
                 target_auroc = getattr(self, f"{step_name}_target_aurocs")[
                     sanatize(target_label)

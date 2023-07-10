@@ -41,9 +41,12 @@ def main():
     )
     dl = DataLoader(ds, shuffle=False, num_workers=args.num_workers)
 
+    # FIXME The number of accelerators is currently fixed because
+    # `trainer.predict()` does not return any predictions if used with the
+    # default strategy no multiple GPUs
     trainer = pl.Trainer(
         default_root_dir=args.output_dir,
-        accelerator="auto",
+        accelerator=args.accelerator,
         devices=1,
     )
     predictions = torch.cat(trainer.predict(model=model, dataloaders=dl))  # type: ignore
@@ -127,6 +130,7 @@ def make_argument_parser() -> argparse.ArgumentParser:
     )
 
     parser.add_argument("--num-workers", type=int, default=min(os.cpu_count() or 0, 8))
+    parser.add_argument("--accelerator", type=str, default="auto")
 
     return parser
 
