@@ -38,7 +38,9 @@ def encode_targets(
     if not (
         name == "barspoon-targets" and (spec := Specifier("~=1.0")).contains(version)
     ):
-        raise ValueError(f"model not compatible with barspoon-targets {spec}", version)
+        raise ValueError(
+            f"incompatible target file: expected barspoon-targets{spec}, found `{name} {version}`"
+        )
 
     if ignored:
         logging.warn(f"ignored {ignored}")

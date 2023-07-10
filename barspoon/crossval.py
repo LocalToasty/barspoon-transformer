@@ -253,6 +253,13 @@ def make_argument_parser() -> argparse.ArgumentParser:
 def get_splits(
     items: npt.NDArray[Any], n_splits: int = 6
 ) -> Iterator[Tuple[npt.NDArray[Any], npt.NDArray[Any], npt.NDArray[Any]]]:
+    """Splits a dataset into six training, validation and test sets
+
+    This generator will yield `n_split` sets of training, validation and test
+    sets.  To do so, it first splits `items` into `n_splits` different parts,
+    and selects a different part as validation and testing set.  The training
+    set is made up of the remaining `n_splits`-2 parts.
+    """
     splitter = KFold(n_splits=n_splits, shuffle=True)
     # We have to explicitly force `dtype=np.object_` so this doesn't fail for
     # folds of different sizes
