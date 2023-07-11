@@ -69,7 +69,7 @@ def main():
     model = LitEncDecTransformer.load_from_checkpoint(
         checkpoint_path=args.checkpoint_path
     ).to(device=args.device, dtype=torch.bfloat16)
-    name, version = model.hparams["version"].split(" ")
+    name, version = model.hparams.get("version", "undefined 0").split(" ")
     if not (
         name == "barspoon-transformer"
         and (spec := SpecifierSet(">=1.0,<3")).contains(version)
