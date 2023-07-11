@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytorch_lightning as pl
 import torch
+from packaging.specifiers import SpecifierSet
 from torch.utils.data import DataLoader
 
 from barspoon.data import BagDataset
@@ -21,6 +22,16 @@ def main():
     model = LitEncDecTransformer.load_from_checkpoint(
         checkpoint_path=args.checkpoint_path
     )
+    name, version = model.hparams.get("version", "undefined 0").split(" ")
+    if not (
+        name == "barspoon-transformer"
+        and (spec := SpecifierSet(">=1.0,<3")).contains(version)
+    ):
+        raise ValueError(
+            f"model not compatible. Found {name} {version}, expected barspoon-transformer {spec}",
+            model.hparams["version"],
+        )
+
     target_labels = model.hparams["target_labels"]
 
     dataset_df = make_dataset_df(
