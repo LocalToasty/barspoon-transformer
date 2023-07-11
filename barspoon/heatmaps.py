@@ -64,9 +64,11 @@ def main():
     args = parser.parse_args()
 
     # Load model and ensure its version is compatible
+    # We do all computations in bfloat16, as it needs way less VRAM and performs
+    # virtually identical to float32 in inference tasks.
     model = LitEncDecTransformer.load_from_checkpoint(
         checkpoint_path=args.checkpoint_path
-    ).to(torch.bfloat16)
+    ).to(device=args.device, dtype=torch.bfloat16)
     name, version = model.hparams["version"].split(" ")
     if not (
         name == "barspoon-transformer"
@@ -98,8 +100,10 @@ def main():
 
         # Load features
         with h5py.File(h5_path) as h5_file:
-            feats = h5_file["feats"][:]
-            coords = h5_file["coords"][:]
+            feats = torch.tensor(
+                h5_file["feats"][:], dtype=torch.bfloat16, device=args.device
+            )
+            coords = torch.tensor(h5_file["coords"][:])
             xs = np.sort(np.unique(coords[:, 0]))
             stride = np.min(xs[1:] - xs[:-1])
 
@@ -108,7 +112,7 @@ def main():
         # just skip the slide
         try:
             gradcams = compute_attention_maps(
-                model, feats, coords, stride, args.batch_size
+                model, feats, coords.type_as(feats), stride, args.batch_size
             )
         except Exception as exception:
             logging.error(f"error while processing {slides[0]}: {exception})")
@@ -188,7 +192,7 @@ def main():
 
 
 def compute_attention_maps(
-    model, feats, coords, stride, batch_size
+    model, feats: torch.Tensor, coords, stride, batch_size
 ) -> npt.NDArray[np.float_]:
     """Computes a stack of attention maps
 
@@ -202,13 +206,7 @@ def compute_attention_maps(
     # we don't calculate all gradcams at once, but do it in batches instead
     n_outputs = sum(len(w) for w in model.weights)
     atts = []
-    feats_t = (
-        torch.tensor(feats)
-        .unsqueeze(0)
-        .to(torch.bfloat16)
-        .repeat(min(batch_size, n_outputs), 1, 1)
-        .cuda()  # TODO don't hard-code
-    )
+    feats_t = feats.unsqueeze(0).repeat(min(batch_size, n_outputs), 1, 1)
     # `feats_t` now has the shape [n_outs, n_tiles, n_features]
     # or [batch_size, n_tiles, n_features], whichever is smaller
     model = model.eval()
@@ -232,7 +230,7 @@ def compute_attention_maps(
     # If n_outs isn't divisible by batch_size, we'll have some superfluous
     # output maps which we have to drop
     atts = torch.cat(atts)[:n_outputs]
-    return vals_to_im(atts.permute(1, 0), coords, stride)
+    return vals_to_im(atts.permute(1, 0), coords.to(torch.int).cpu().numpy(), stride)
 
 
 def vals_to_im(
@@ -324,6 +322,12 @@ def make_argument_parser() -> argparse.ArgumentParser:
     )
 
     parser.add_argument("--batch-size", type=int, default=0x20)
+
+    parser.add_argument(
+        "--device",
+        type=str,
+        default="cuda:0" if torch.cuda.is_available() else "cpu",
+    )
 
     return parser
 
