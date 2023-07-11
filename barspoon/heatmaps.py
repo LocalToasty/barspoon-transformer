@@ -50,7 +50,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import numpy.typing as npt
 import torch
-from packaging.specifiers import Specifier
+from packaging.specifiers import SpecifierSet
 from PIL import Image
 from PIL.PngImagePlugin import PngInfo
 from tqdm import tqdm
@@ -72,10 +72,10 @@ def main():
     name, version = model.hparams["version"].split(" ")
     if not (
         name == "barspoon-transformer"
-        and (spec := Specifier("~=1.0")).contains(version)
+        and (spec := SpecifierSet(">=1.0,<3")).contains(version)
     ):
         raise ValueError(
-            f"model not compatible with barspoon-transformer {spec}",
+            f"model not compatible. Found {name} {version}, expected barspoon-transformer {spec}",
             model.hparams["version"],
         )
 
@@ -108,14 +108,17 @@ def main():
             stride = np.min(xs[1:] - xs[:-1])
 
         # Generate the gradcams
-        # If something goes wrong (most probably an OOM error),
-        # just skip the slide
+        # Skip the slide if we are out of memory
         try:
             gradcams = compute_attention_maps(
-                model, feats, coords, stride, args.batch_size
+                model=model,
+                feats=feats,
+                coords=coords,
+                stride=stride,
+                batch_size=args.batch_size,
             )
-        except Exception as exception:
-            logging.error(f"error while processing {slides[0]}: {exception})")
+        except torch.cuda.OutOfMemoryError as oom_error:  # type: ignore
+            logging.error(f"error while processing {slides[0]}: {oom_error})")
             continue
 
         mask = (gradcams > 0).any(axis=0)
@@ -192,6 +195,7 @@ def main():
 
 
 def compute_attention_maps(
+    *,
     model: LitEncDecTransformer,
     feats: torch.Tensor,
     coords: torch.Tensor,
@@ -218,7 +222,7 @@ def compute_attention_maps(
         feats_t = feats_t.detach()  # Zero grads of input features
         feats_t.requires_grad = True
         model.zero_grad()
-        scores = model.predict_step(feats_t, batch_idx=0)
+        scores = model.predict_step((feats_t, coords.type_as(feats_t)), batch_idx=0)
         # Now we have a stack of predictions for each class.  All the rows
         # should be exactly the same, as they only depend on the (repeated and
         # thus identical) tile features.  If we now take the diagonal values
