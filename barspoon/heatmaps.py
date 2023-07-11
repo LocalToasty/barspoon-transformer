@@ -112,7 +112,7 @@ def main():
         # just skip the slide
         try:
             gradcams = compute_attention_maps(
-                model, feats, coords.type_as(feats), stride, args.batch_size
+                model, feats, coords, stride, args.batch_size
             )
         except Exception as exception:
             logging.error(f"error while processing {slides[0]}: {exception})")
@@ -192,7 +192,11 @@ def main():
 
 
 def compute_attention_maps(
-    model, feats: torch.Tensor, coords, stride, batch_size
+    model: LitEncDecTransformer,
+    feats: torch.Tensor,
+    coords: torch.Tensor,
+    stride: int,
+    batch_size: int,
 ) -> npt.NDArray[np.float_]:
     """Computes a stack of attention maps
 
