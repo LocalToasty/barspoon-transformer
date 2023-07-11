@@ -1,7 +1,7 @@
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Dict, List, Mapping, Optional, Tuple
 
 import h5py
 import torch
@@ -21,7 +21,7 @@ class BagDataset(Dataset):
     Each of the h5 files needs to have a dataset called `feats` of shape N x F,
     where N is the number of instances and F the number of features per instance.
     """
-    targets: torch.Tensor
+    targets: Mapping[str, torch.Tensor]
     """The label of each bag"""
     instances_per_bag: Optional[int]
     """The number of instances to sample, or all samples if None"""
@@ -45,7 +45,7 @@ class BagDataset(Dataset):
 
     def __getitem__(
         self, index: int
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
         """Returns features, positions, targets"""
 
         # Collect features from all requested slides
@@ -92,7 +92,11 @@ class BagDataset(Dataset):
                 deterministic=self.deterministic,
             )
 
-        return feats, coords, self.targets[index]
+        return (
+            feats,
+            coords,
+            {label: target[index] for label, target in self.targets.items()},
+        )
 
 
 def pad_or_sample(*xs: torch.Tensor, n: int, deterministic: bool) -> List[torch.Tensor]:
