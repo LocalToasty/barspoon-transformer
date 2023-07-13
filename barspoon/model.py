@@ -57,16 +57,23 @@ class EncDecTransformer(nn.Module):
     both process the tiles' information and the class token's processing.  Using
     an encoder-decoder architecture alleviates these issues, as the data-flow of
     the class tokens is completely independent of the encoding of the tiles.
+    Furthermore, analysis has shown that there is almost no interaction between
+    the different classes in the decoder.  While this points to the decoder
+    being more powerful than needed in practice, this also means that each
+    label's prediction is mostly independent of the others.  As a consequence,
+    noisy labels will not negatively impact the accuracy of non-noisy ones.
 
     In our experiments so far we did not see any improvement by adding
     positional encodings.  We tried
+
      1. [Sinusodal encodings][1]
      2. Adding absolute positions to the feature vector, scaled down so the
         maximum value in the training dataset is 1.
-    Since neither reduced performance the author percieves the first one to be
-    more elegant (as it doesn't depend on the training set), we opted to keep
-    the positional encoding regardless in the hopes of it improving performance
-    on future tasks.
+
+    Since neither reduced performance and the author percieves the first one to
+    be more elegant (as the magnitude of the positional encodings is bounded),
+    we opted to keep the positional encoding regardless in the hopes of it
+    improving performance on future tasks.
 
     The architecture _differs_ from the one descibed in [Attention Is All You
     Need][1] as follows:
