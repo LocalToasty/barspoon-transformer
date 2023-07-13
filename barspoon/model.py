@@ -1,7 +1,5 @@
 # %%
-import re
-from collections.abc import Sequence
-from typing import Any, Dict, Mapping, Optional, Tuple
+from typing import Any, Dict, Mapping, Tuple
 
 import numpy as np
 import pytorch_lightning as pl
@@ -122,7 +120,7 @@ class EncDecTransformer(nn.Module):
 
         # One class token per output label
         self.class_tokens = nn.ParameterDict(
-            {target_label: torch.rand(d_model) for target_label in target_n_outs}
+            {sanatize(target_label): torch.rand(d_model) for target_label in target_n_outs}
         )
 
         decoder_layer = nn.TransformerDecoderLayer(
@@ -138,7 +136,7 @@ class EncDecTransformer(nn.Module):
 
         self.heads = nn.ModuleDict(
             {
-                target_label: nn.Linear(in_features=d_model, out_features=n_out)
+                sanatize(target_label): nn.Linear(in_features=d_model, out_features=n_out)
                 for target_label, n_out in target_n_outs.items()
             }
         )
@@ -170,13 +168,13 @@ class EncDecTransformer(nn.Module):
 
         target_labels = list(self.class_tokens)
         class_tokens = torch.stack(
-            [self.class_tokens[t] for t in target_labels]
+            [self.class_tokens[sanatize(t)] for t in target_labels]
         ).expand(batch_size, -1, -1)
         class_tokens = self.transformer_decoder(tgt=class_tokens, memory=tile_tokens)
 
         # Apply the corresponding head to each class token
         logits = {
-            target_label: self.heads[target_label](class_token)
+            target_label: self.heads[sanatize(target_label)](class_token)
             for target_label, class_token in zip(
                 target_labels,
                 class_tokens.permute(1, 0, 2),  # Permute to [target, batch, d_model]
