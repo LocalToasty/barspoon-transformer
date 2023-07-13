@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "barspoon-transformer"
-version = "2.0.2"
+version = "2.0.3"
 requires-python = ">=3.10"
 authors = [
     { name="Marko van Treeck", email="markovantreeck@gmail.com" },
@@ -24,6 +24,7 @@ dependencies = [
     "packaging~=23.1",
     "pandas~=2.0",
     "scikit-learn~=1.2",
+    "tomli~=2.0",   # replace with stdlib `tomllib` once 3.11 becomes necessary
     "torch~=2.0",
     "torchmetrics~=0.11.4",
     "pytorch-lightning~=2.0",

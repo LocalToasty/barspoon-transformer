@@ -1,6 +1,6 @@
 import argparse
 import os
-import tomllib
+import tomli
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Sequence, Tuple
 
@@ -27,7 +27,7 @@ def main():
     torch.set_float32_matmul_precision("medium")
 
     with open(args.target_file, "rb") as target_toml_file:
-        target_info = tomllib.load(target_toml_file)
+        target_info = tomli.load(target_toml_file)
     target_labels = list(target_info["targets"].keys())
 
     dataset_df = make_dataset_df(
