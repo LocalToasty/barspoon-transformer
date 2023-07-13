@@ -310,6 +310,8 @@ def main():
 
         # Calculate weights of well-populated classes
         # inverse to their frequency of occurrence
+        prefix = "#"
+
         well_supported_counts = counts[counts >= args.category_min_count]
         pos_weights = well_supported_counts.sum() / well_supported_counts
         pos_weights /= pos_weights.sum()
@@ -379,6 +381,7 @@ def main():
         )
 
         # Class weights are just 1/N where N is the number of bins
+        prefix = "#"
         outtoml.write(
             f'{prefix}[targets."{target_label.translate(escape_table)}".class_weights]\n'
         )
