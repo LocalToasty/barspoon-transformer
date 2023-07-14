@@ -96,6 +96,19 @@ class DistanceAwareMultiheadAttention(nn.Module):
         continuous: bool = True,
         num_embeddings: int = 2,  # if continuous, must be 2
     ):
+        """Multihead attention with relative position representations.
+
+        This module is a drop-in replacement for `torch.nn.MultiheadAttention` with the following differences:
+        - The `embed_keys`, `embed_queries`, and `embed_values` arguments control whether the keys, queries, and values are embedded.
+        - The `continuous` argument controls whether the relative positional encoding is continuous or discrete.
+        - The `num_embeddings` argument controls the number of embeddings used for the relative positional encoding.
+        - The `trainable_embeddings` argument controls whether the embeddings are trainable.
+
+        The relative positional encoding is implemented as described in [1], [2] for the discrete case and [2] for the continuous case.
+
+        [1]: https://arxiv.org/abs/1803.02155 "Self-Attention with Relative Position Representations"
+        [2]: https://arxiv.org/abs/2305.10552 "Deep Multiple Instance Learning with Distance-Aware Self-Attention"
+        """
         super().__init__()
 
         # Unsupported arguments
@@ -256,7 +269,10 @@ class DistanceAwareMultiheadAttention(nn.Module):
 
 
 class DistanceAwareTransformerEncoderLayer(nn.Module):
-    __constants__ = ["batch_first", "norm_first"]
+    """Transformer encoder layer with relative position representations.
+
+    This module is a modified version of the standard TransformerEncoderLayer.
+    """
 
     def __init__(
         self,
