@@ -16,7 +16,7 @@ from torch.utils.data import DataLoader
 from barspoon.data import BagDataset
 from barspoon.model import LitEncDecTransformer
 from barspoon.target_file import encode_targets
-from barspoon.utils import make_dataset_df, make_preds_df
+from barspoon.utils import flatten_batched_dicts, make_dataset_df, make_preds_df
 
 
 def main():
@@ -55,25 +55,25 @@ def main():
             overlap := set(train_df.index) & set(valid_df.index)
         ), f"overlap between training and testing set: {overlap}"
 
-        train_encoded_targets, representatives, weights = encode_targets(
+        train_encoded_targets = encode_targets(
             train_df, target_labels=target_labels, **target_info
         )
 
-        valid_encoded_targets, _, _ = encode_targets(
+        valid_encoded_targets = encode_targets(
             valid_df, target_labels=target_labels, **target_info
         )
 
-        test_encoded_targets, _, _ = encode_targets(
+        test_encoded_targets = encode_targets(
             test_df, target_labels=target_labels, **target_info
         )
 
         train_dl, valid_dl, test_dl = make_dataloaders(
             train_bags=train_df.path.values,
-            train_targets=train_encoded_targets,
+            train_targets={k: v.encoded for k, v in train_encoded_targets.items()},
             valid_bags=valid_df.path.values,
-            valid_targets=valid_encoded_targets,  # type: ignore
+            valid_targets={k: v.encoded for k, v in valid_encoded_targets.items()},
             test_bags=test_df.path.values,
-            test_targets=test_encoded_targets,  # type: ignore
+            test_targets={k: v.encoded for k, v in test_encoded_targets.items()},
             instances_per_bag=args.instances_per_bag,
             batch_size=args.batch_size,
             num_workers=args.num_workers,
@@ -85,10 +85,10 @@ def main():
         model = LitEncDecTransformer(
             d_features=d_features,
             target_labels=target_labels,
-            weights=weights,
+            weights={k: v.weight for k, v in train_encoded_targets.items()},
             # Other hparams
-            version="barspoon-transformer 2.0",
-            categories=representatives,
+            version="barspoon-transformer 3.0",
+            categories={k: v.categories for k, v in train_encoded_targets.items()},
             target_file=target_info,
             **{
                 f"train_{train_df.index.name}": list(train_df.index),
@@ -130,22 +130,24 @@ def main():
         trainer.test(model=model, dataloaders=test_dl)
 
         # Save best validation set predictions
-        valid_preds = torch.cat(trainer.predict(model=model, dataloaders=valid_dl, return_predictions=True))  # type: ignore
+        valid_preds = flatten_batched_dicts(
+            trainer.predict(model=model, dataloaders=valid_dl, return_predictions=True)
+        )
         valid_preds_df = make_preds_df(
             predictions=valid_preds,
             base_df=valid_df,
-            target_labels=target_labels,
-            categories=representatives,
+            categories={k: v.categories for k, v in train_encoded_targets.items()},
         )
         valid_preds_df.to_csv(fold_dir / "valid-patient-preds.csv")
 
         # Save test set predictions
-        test_preds = torch.cat(trainer.predict(model=model, dataloaders=test_dl, return_predictions=True))  # type: ignore
+        test_preds = flatten_batched_dicts(
+            trainer.predict(model=model, dataloaders=test_dl, return_predictions=True)
+        )
         test_preds_df = make_preds_df(
             predictions=test_preds,
             base_df=test_df,
-            target_labels=target_labels,
-            categories=representatives,
+            categories={k: v.categories for k, v in train_encoded_targets.items()},
         )
         test_preds_df.to_csv(fold_dir / "patient-preds.csv")
 

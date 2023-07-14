@@ -3,7 +3,7 @@ import argparse
 import logging
 import sys
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, NamedTuple, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -16,6 +16,12 @@ from barspoon.utils import read_table
 __all__ = ["encode_targets", "decode_targets"]
 
 
+class EncodedTarget(NamedTuple):
+    categories: List[str]
+    encoded: torch.Tensor
+    weight: torch.Tensor
+
+
 def encode_targets(
     clini_df: pd.DataFrame,
     *,
@@ -24,13 +30,13 @@ def encode_targets(
     version: str = "barspoon-targets 1.0",
     targets: Dict[str, Any],
     **ignored,
-) -> Tuple[torch.Tensor, List[str], torch.Tensor]:
+) -> Dict[str, EncodedTarget]:
     """Encodes the information in a clini table into a tensor
 
     Returns:
         A tuple consisting of
          1. The encoded targets
-         2. The categories' representative  #TODO elaborate
+         2. The categories' representatives #TODO elaborate
          3. A list of the targets' classes' weights
     """
     # Make sure target file has the right version
@@ -45,7 +51,7 @@ def encode_targets(
     if ignored:
         logging.warn(f"ignored {ignored}")
 
-    all_representatives, encoded_cols, weights = [], [], []
+    encoded_targets = {}
     for target_label in target_labels:
         info = targets[target_label]
 
@@ -53,23 +59,22 @@ def encode_targets(
             representatives, encoded, weight = encode_category(
                 clini_df=clini_df, target_label=target_label, **info
             )
-            all_representatives.append(representatives)
-            encoded_cols.append(encoded)
-            weights.append(weight)
+            encoded_targets[target_label] = EncodedTarget(
+                categories=representatives, encoded=encoded, weight=weight
+            )
 
         elif "thresholds" in info:
             representatives, encoded, weight = encode_quantize(
                 clini_df=clini_df, target_label=target_label, **info
             )
-            all_representatives.append(representatives)
-            encoded_cols.append(encoded)
-            weights.append(weight)
+            encoded_targets[target_label] = EncodedTarget(
+                categories=representatives, encoded=encoded, weight=weight
+            )
 
         else:
             logging.warn(f"ignoring unrecognized target type {target_label}")
 
-    assert len(encoded_cols) == len(weights)
-    return torch.cat(encoded_cols, dim=1), all_representatives, weights
+    return encoded_targets
 
 
 def encode_category(
@@ -305,6 +310,8 @@ def main():
 
         # Calculate weights of well-populated classes
         # inverse to their frequency of occurrence
+        prefix = "#"
+
         well_supported_counts = counts[counts >= args.category_min_count]
         pos_weights = well_supported_counts.sum() / well_supported_counts
         pos_weights /= pos_weights.sum()
@@ -374,6 +381,7 @@ def main():
         )
 
         # Class weights are just 1/N where N is the number of bins
+        prefix = "#"
         outtoml.write(
             f'{prefix}[targets."{target_label.translate(escape_table)}".class_weights]\n'
         )
