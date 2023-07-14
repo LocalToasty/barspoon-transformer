@@ -1,4 +1,67 @@
-"""Automatically generate target information from clini table"""
+"""Automatically generate target information from clini table
+
+# The `barspoon-targets 2.0` File Format
+
+A barspoon target file is a [TOML][1] file with the following entries:
+
+  - A `version` key mapping to a version string `"barspoon-targets <V>"`, where
+    `<V>` is a [PEP-440 version string][2] compatible with `2.0`.
+  - A `targets` table, the keys of which are target labels (as found in the
+    clinical table) and the values specify exactly one of the following:
+     1. A categorical target label, marked by the presence of a `categories`
+        key-value pair.
+     2. A target label to quantize, marked by the presence of a `thresholds`
+        key-value pair.
+     3. A target format defined in in a later version of barspoon targets.
+    A target may only ever have one of the fields `categories` or `thresholds`.
+    A definition of these entries can be found below.
+
+[1]: https://toml.io "Tom's Obvious Minimal Language"
+[2]: https://peps.python.org/pep-0440/
+    "PEP 440 - Version Identification and Dependency Specification"
+
+## Categorical Target Label
+
+A categorical target is a target table with a key-value pair `categories`.
+`categories` contains a list of lists of literal strings.  Each list of strings
+will be treated as one category, with all literal strings within that list being
+treated as one representative for that category.  This allows the user to easily
+group related classes into one large class (i.e. `"True", "1", "Yes"` could all
+be unified into the same category).
+
+### Category Weights
+
+It is possible to assign a weight to each category, to e.g. weigh rarer classes
+more heavily.  The weights are stored in a table `targets.LABEL.class_weights`,
+whose keys is the first representative of each category, and the values of which
+is the weight of the category as a floating point number.
+
+## Target Label to Quantize
+
+If a target has the `thresholds` option key set, it is interpreted as a
+continuous target which has to be quantized.  `thresholds` has to be a list of
+floating point numbers [t_0, t_n], n > 1 containing the thresholds of the bins
+to quantize the values into.  A categorical target will be quantized into bins
+
+```asciimath
+b_0 = [t_0; t_1], b_1 = (t_1; b_2], ... b_(n-1) = (t_(n-1); t_n]
+```
+
+The bins will be treated as categories with names
+`f"[{t_0:+1.2e};{t_1:+1.2e}]"` for the first bin and
+`f"({t_i:+1.2e};{t_(i+1):+1.2e}]"` for all other bins
+
+To avoid confusion, we recommend to also format the `thresholds` list the same
+way.
+
+The bins can also be weighted. See _Categorical Target Label: Category Weights_
+for details.
+
+  > Experience has shown that many labels contain non-negative values with a
+  > disproportionate amount (more than n_samples/n_bins) of zeroes. We thus
+  > decided to make the _right_ side of each bin inclusive, as the bin (-A,0]
+  > then naturally includes those zero values.
+"""
 import argparse
 import logging
 import sys
@@ -6,6 +69,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, NamedTuple, Optional, Sequence, Tuple
 
 import numpy as np
+import numpy.typing as npt
 import pandas as pd
 import torch
 import torch.nn.functional as F
@@ -27,7 +91,7 @@ def encode_targets(
     *,
     target_labels: Iterable[str],
     # From targets toml
-    version: str = "barspoon-targets 1.0",
+    version: str = "barspoon-targets 2.0",
     targets: Dict[str, Any],
     **ignored,
 ) -> Dict[str, EncodedTarget]:
@@ -42,7 +106,7 @@ def encode_targets(
     # Make sure target file has the right version
     name, version = version.split(" ")
     if not (
-        name == "barspoon-targets" and (spec := Specifier("~=1.0")).contains(version)
+        name == "barspoon-targets" and (spec := Specifier("~=2.0")).contains(version)
     ):
         raise ValueError(
             f"incompatible target file: expected barspoon-targets{spec}, found `{name} {version}`"
@@ -118,36 +182,47 @@ def encode_quantize(
     thresholds: List[float],
     class_weights: Optional[Dict[str, float]] = None,
     **ignored,
-) -> Tuple[torch.Tensor, torch.Tensor, List[str]]:
+) -> Tuple[torch.Tensor, torch.Tensor, npt.NDArray[np.str_]]:
     # Warn user of unused labels
     if ignored:
         logging.warn(f"ignored labels in target {target_label}: {ignored}")
 
     n_bins = len(thresholds) - 1
-    numeric_vals = torch.tensor(pd.to_numeric(clini_df[target_label]).values).view(
+    numeric_vals = torch.tensor(pd.to_numeric(clini_df[target_label]).values).reshape(
         -1, 1
     )
-    # Count the number of left bounds of bins each item is greater or equal than
-    # This will lead to nans being mapped to 0,
-    # whereas each other classes will be set to C+1
-    bin_index = (numeric_vals >= torch.tensor(thresholds).view(1, -1)).count_nonzero(
-        dim=1
+
+    # Map each value to a class index as follows:
+    #  1. If the value is NaN or less than the left-most threshold, use class
+    #     index 0
+    #  2. If it is between the left-most and the right-most threshold, set it to
+    #     the bin number (starting from 1)
+    #  3. If it is larger than the right-most threshold, set it to N_bins + 1
+    bin_index = (
+        (numeric_vals > torch.tensor(thresholds).reshape(1, -1)).count_nonzero(1)
+        # For the first bucket, we have to include the lower threshold
+        + (numeric_vals.reshape(-1) == thresholds[0])
     )
     # One hot encode and discard nan columns (first and last col)
-    # This also maps all classes from C+1 back to C
     one_hot = F.one_hot(bin_index, num_classes=n_bins + 2)[:, 1:-1]
 
     # Class weights
     categories = [
-        f"[{l:+1.2e};{u:+1.2e})" for l, u in zip(thresholds[:-1], thresholds[1:])
+        f"[{thresholds[0]:+1.2e};{thresholds[1]:+1.2e}]",
+        *(
+            f"({l:+1.2e};{u:+1.2e}]"
+            for l, u in zip(thresholds[1:-1], thresholds[2:], strict=True)
+        ),
     ]
+
     if class_weights is not None:
         weight = torch.tensor([class_weights[c] for c in categories])
     else:
-        # No class weights given; use 1/#bins
-        weight = torch.tensor([1 / n_bins] * n_bins)
+        # No class weights given; use normalized inverse frequency
+        counts = one_hot.sum(0)
+        weight = (w := (np.divide(counts.sum(), counts, where=counts > 0))) / w.sum()
 
-    return categories, one_hot, weight
+    return np.array(categories), one_hot, weight
 
 
 def decode_targets(
@@ -155,12 +230,12 @@ def decode_targets(
     *,
     target_labels: Sequence[str],
     targets: Dict[str, Any],
-    version: str = "barspoon-targets 1.0",
+    version: str = "barspoon-targets 2.0",
     **ignored,
 ) -> List[np.array]:
     name, version = version.split(" ")
     if not (
-        name == "barspoon-targets" and (spec := Specifier("~=1.0")).contains(version)
+        name == "barspoon-targets" and (spec := Specifier("~=2.0")).contains(version)
     ):
         raise ValueError(f"model not compatible with barspoon-targets {spec}", version)
 
@@ -266,8 +341,8 @@ def main():
     outtoml = args.output_file
     clini_df = pd.concat([read_table(c) for c in args.clini_tables])
 
-    # Artifact name and version (follows semantic versioning)
-    outtoml.write('version = "barspoon-targets 1.0"\n\n')
+    # Artifact name and version
+    outtoml.write('version = "barspoon-targets 2.0"\n\n')
 
     # Translation table to escape basic strings in TOML
     escape_table = str.maketrans(
@@ -292,13 +367,9 @@ def main():
         prefix = "#" if (counts >= args.category_min_count).sum() <= 1 else ""
 
         outtoml.write(f'{prefix}[targets."{target_label.translate(escape_table)}"]\n')
-        if prefix:
-            outtoml.write(
-                "## WARNING: fewer than two classes with sufficient #samples\n"
-            )
 
-        # List all categories
-        # with little-populated categories being commented out
+        # List all categories with little-populated categories being commented
+        # out
         outtoml.write(f"{prefix}categories = [\n")
         for cat, n in sorted(counts.items()):
             if n < args.category_min_count:
@@ -310,54 +381,21 @@ def main():
 
         # Calculate weights of well-populated classes
         # inverse to their frequency of occurrence
-        prefix = "#"
-
         well_supported_counts = counts[counts >= args.category_min_count]
         pos_weights = well_supported_counts.sum() / well_supported_counts
         pos_weights /= pos_weights.sum()
         outtoml.write(
-            f'{prefix}[targets."{target_label.translate(escape_table)}".class_weights]\n'
+            f'{prefix}#[targets."{target_label.translate(escape_table)}".class_weights]\n'
         )
-        for cat, weight in sorted(pos_weights.items()):
-            outtoml.write(f'{prefix}"{cat.translate(escape_table)}" = {weight:1.4g}\n')
+        for cat, weights in sorted(pos_weights.items()):
+            outtoml.write(
+                f'{prefix}#"{cat.translate(escape_table)}" = {weights:1.4g}\n'
+            )
         outtoml.write("\n")
 
     # Qunatization bins for continuous variables
     for target_label, bincount in args.quantize:
         vals = pd.to_numeric(clini_df[target_label]).dropna()
-        # vals w/o infinite values / nans
-        vals_finite = vals.replace(
-            {
-                -np.inf: np.nan,
-                np.inf: np.nan,
-            }
-        ).dropna()
-        counts, bins = np.histogram(vals_finite)
-
-        # Comment out this section if the bins are too small
-        prefix = "#" if len(vals_finite) // bincount < args.category_min_count else ""
-
-        # Draw a histogram of all classes to give the user a feeling
-        # for the distribution of the data
-        outtoml.write(f'{prefix}[targets."{target_label.translate(escape_table)}"]\n')
-        outtoml.write(f"{prefix}# bin       count\n")
-        # Bin exclusively for -inf values
-        if (vals == -np.inf).any():
-            inf_count = (vals == -np.inf).sum()
-            outtoml.write(
-                f"{prefix}# -inf      {inf_count:>5d} {'*'*np.round(60*inf_count / counts.max())}\n"
-            )
-        # Bins for finite values
-        for bin, count, width in zip(
-            bins, counts, np.round(60 * counts / counts.max()).astype(int)
-        ):
-            outtoml.write(f"{prefix}# {bin:+1.2e} {count:>5d} {'*'*width}\n")
-        # Bin exclusively for inf values
-        if (vals == np.inf).any():
-            inf_count = (vals == np.inf).sum()
-            outtoml.write(
-                f"{prefix}# +inf      {inf_count:>5d} {'*'*np.round(60*inf_count / counts.max()).astype(int)}\n"
-            )
 
         # Calculate quantization thresholds for n equally sized bins
         # -inf, +inf have to be set to finite values for np.quantile to work
@@ -367,29 +405,91 @@ def main():
                 np.inf: vals[vals != np.inf].max(),
             }
         ).dropna()
-        thresholds = [
-            -np.inf,
-            *np.quantile(vals_clamped, q=np.linspace(0, 1, bincount + 1))[1:-1],
-            np.inf,
-        ]
+        thresholds = np.array(
+            [
+                -np.inf,
+                *np.quantile(vals_clamped, q=np.linspace(0, 1, bincount + 1))[1:-1],
+                np.inf,
+            ]
+        )
 
-        # Just a list of thresholds
+        _, one_hot, weights = encode_quantize(
+            clini_df=clini_df, target_label=target_label, thresholds=thresholds
+        )
+
+        # We do a two-step approach:
+        # First, we naively calculate the quantile thresholds (as done in the
+        # above lines).  If some values appear often (more than n_samples/n_bins
+        # times), some of the thresholds may be the same.  In that case, we drop
+        # the superfluous classes (below).
+        well_supported = one_hot.sum(0) > args.category_min_count
+        thresholds = [thresholds[0], *thresholds[1:][well_supported]]
+        categories, one_hot, weights = encode_quantize(
+            clini_df=clini_df, target_label=target_label, thresholds=thresholds
+        )
+
+        # Badly supported target: comment out
+        prefix = "#" if len(categories) < 2 else ""
+
+        outtoml.write(f'{prefix}[targets."{target_label.translate(escape_table)}"]\n')
+
+        draw_histogram(vals=vals, outtoml=outtoml, prefix=prefix)
+
+        if not well_supported.all():
+            outtoml.write(
+                f"{prefix}# Too imbalanced a dataset to quantize into {bincount} bins"
+            )
+
+        # Print out a list of thresholds
         # The items outside of the lowest / highest threshold are to be
         # interpreted as NaNs
         outtoml.write(
             f"{prefix}thresholds = [ {', '.join(f'{t:+1.2e}' for t in thresholds)} ]\n"
         )
 
-        # Class weights are just 1/N where N is the number of bins
-        prefix = "#"
+        # Write the weights
         outtoml.write(
-            f'{prefix}[targets."{target_label.translate(escape_table)}".class_weights]\n'
+            f'{prefix}#[targets."{target_label.translate(escape_table)}".class_weights]\n'
         )
-        for lower, upper in zip(thresholds[:-1], thresholds[1:]):
+        for category, weight, count in zip(
+            categories, weights, one_hot.sum(0), strict=True
+        ):
             outtoml.write(
-                f'{prefix}"[{lower:+1.2e};{upper:+1.2e})" = {1/bincount:1.4g}\n'
+                f'{prefix}#"{category}" = {weight:1.4g}\t# count = {int(count)}\n'
             )
         outtoml.write("\n")
+
+
+def draw_histogram(*, vals: npt.NDArray[np.float_], outtoml, prefix: str):
+    # vals w/o infinite values / nans
+    vals_finite = vals.replace(
+        {
+            -np.inf: np.nan,
+            np.inf: np.nan,
+        }
+    ).dropna()
+    counts, bins = np.histogram(vals_finite)
+
+    # Draw a histogram of all classes to give the user a feeling
+    # for the distribution of the data
+    outtoml.write(f"{prefix}# bin       count\n")
+    # Bin exclusively for -inf values
+    if (vals == -np.inf).any():
+        inf_count = (vals == -np.inf).sum()
+        outtoml.write(
+            f"{prefix}# -inf      {inf_count:>5d} {'*'*np.round(60*inf_count / counts.max())}\n"
+        )
+    # Bins for finite values
+    for bin, count, width in zip(
+        bins, counts, np.round(60 * counts / counts.max()).astype(int)
+    ):
+        outtoml.write(f"{prefix}# {bin:+1.2e} {count:>5d} {'*'*width}\n")
+    # Bin exclusively for inf values
+    if (vals == np.inf).any():
+        inf_count = (vals == np.inf).sum()
+        outtoml.write(
+            f"{prefix}# +inf      {inf_count:>5d} {'*'*np.round(60*inf_count / counts.max()).astype(int)}\n"
+        )
 
 
 if __name__ == "__main__":

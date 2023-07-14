@@ -4,7 +4,7 @@ from collections.abc import Sequence
 from typing import Any, Dict, Mapping, Optional, Tuple
 from functools import partial
 
-import numpy as np
+import re
 import pytorch_lightning as pl
 import torch
 import torch.nn.functional as F
@@ -152,9 +152,11 @@ class EncDecTransformer(nn.Module):
             encoder_layer, num_layers=num_encoder_layers
         )
 
+        self.target_labels = target_n_outs.keys()
+
         # One class token per output label
         self.class_tokens = nn.ParameterDict(
-            {target_label: torch.rand(d_model) for target_label in target_n_outs}
+            {sanitize(target_label): torch.rand(d_model) for target_label in target_n_outs}
         )
 
         decoder_layer = nn.TransformerDecoderLayer(
@@ -170,7 +172,7 @@ class EncDecTransformer(nn.Module):
 
         self.heads = nn.ModuleDict(
             {
-                target_label: nn.Linear(in_features=d_model, out_features=n_out)
+                sanitize(target_label): nn.Linear(in_features=d_model, out_features=n_out)
                 for target_label, n_out in target_n_outs.items()
             }
         )
@@ -194,17 +196,16 @@ class EncDecTransformer(nn.Module):
             encoder_kwargs["tile_positions"] = tile_positions
         tile_tokens = self.transformer_encoder(tile_tokens, **encoder_kwargs)
 
-        target_labels = list(self.class_tokens)
         class_tokens = torch.stack(
-            [self.class_tokens[t] for t in target_labels]
+            [self.class_tokens[sanitize(t)] for t in self.target_labels]
         ).expand(batch_size, -1, -1)
         class_tokens = self.transformer_decoder(tgt=class_tokens, memory=tile_tokens)
 
         # Apply the corresponding head to each class token
         logits = {
-            target_label: self.heads[target_label](class_token)
+            target_label: self.heads[sanitize(target_label)](class_token)
             for target_label, class_token in zip(
-                target_labels,
+                self.target_labels,
                 class_tokens.permute(1, 0, 2),  # Permute to [target, batch, d_model]
                 strict=True,
             )
@@ -231,7 +232,7 @@ class LitMilClassificationMixin(pl.LightningModule):
 
         target_aurocs = torchmetrics.MetricCollection(
             {
-                sanatize(target_label): SafeMulticlassAUROC(num_classes=len(weight))
+                sanitize(target_label): SafeMulticlassAUROC(num_classes=len(weight))
                 for target_label, weight in weights.items()
             }
         )
@@ -273,7 +274,7 @@ class LitMilClassificationMixin(pl.LightningModule):
             # Update target-wise metrics
             for target_label in self.weights:
                 target_auroc = getattr(self, f"{step_name}_target_aurocs")[
-                    sanatize(target_label)
+                    sanitize(target_label)
                 ]
                 is_na = (targets[target_label] == 0).all(dim=1)
                 target_auroc.update(
@@ -316,7 +317,7 @@ class LitMilClassificationMixin(pl.LightningModule):
         return optimizer
 
 
-def sanatize(x: str) -> str:
+def sanitize(x: str) -> str:
     return re.sub(r"[^A-Za-z0-9_]", "_", x)
 
 
