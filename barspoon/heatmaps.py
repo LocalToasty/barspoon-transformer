@@ -84,12 +84,7 @@ def main():
 
     # Load dataset, grouped by filename
     dataset_df = make_dataset_df(
-        clini_tables=args.clini_tables,
-        slide_tables=args.slide_tables,
         feature_dirs=args.feature_dirs,
-        patient_col=args.patient_col,
-        filename_col=args.filename_col,
-        group_by=args.filename_col,
         target_labels=target_labels,
     )
 
@@ -314,24 +309,6 @@ def make_argument_parser() -> argparse.ArgumentParser:
     )
 
     parser.add_argument(
-        "-c",
-        "--clini-table",
-        metavar="CLINI_TABLE",
-        dest="clini_tables",
-        type=Path,
-        action="append",
-        help="Path to the clinical table. Can be specified multiple times",
-    )
-    parser.add_argument(
-        "-s",
-        "--slide-table",
-        metavar="SLIDE_TABLE",
-        dest="slide_tables",
-        type=Path,
-        action="append",
-        help="Path to the slide table. Can be specified multiple times",
-    )
-    parser.add_argument(
         "-f",
         "--feature-dir",
         metavar="FEATURE_DIR",
@@ -348,21 +325,6 @@ def make_argument_parser() -> argparse.ArgumentParser:
         type=Path,
         required=True,
         help="Path to the checkpoint file",
-    )
-
-    parser.add_argument(
-        "--patient-col",
-        metavar="COL",
-        type=str,
-        default="patient",
-        help="Name of the patient column",
-    )
-    parser.add_argument(
-        "--filename-col",
-        metavar="COL",
-        type=str,
-        default="filename",
-        help="Name of the slide column",
     )
 
     parser.add_argument("--batch-size", type=int, default=0x20)
