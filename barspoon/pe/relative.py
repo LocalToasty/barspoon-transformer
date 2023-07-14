@@ -14,28 +14,6 @@ import torch.nn.functional as F
 import torch
 
 
-class EmbeddingTable(nn.Module):
-    """Embedding table with trainable embeddings."""
-
-    def __init__(self, dim, num_embeddings=2, trainable: bool = True):
-        super().__init__()
-        self.embeddings = torch.empty(num_embeddings, dim)
-        if trainable:
-            self.embeddings = nn.Parameter(self.embeddings)
-        self.reset_parameters()
-
-    @torch.no_grad()
-    def reset_parameters(self):
-        nn.init.normal_(self.embeddings, mean=0, std=1)
-
-    def forward(self, weights):
-        # weights shape: Nxnum_embeddings
-        embeddings = self.embeddings  # num_embeddings x dim
-        # embeddings = embeddings * torch.tensor([0, 1]).unsqueeze(-1)
-        X = weights @ embeddings  # Nxdim
-        return X
-
-
 class ContinuousEmbeddingIndex(nn.Module):
     """Provides an embedding index for continuous values using interpolation via a sigmoid."""
 
@@ -52,13 +30,17 @@ class ContinuousEmbeddingIndex(nn.Module):
         self.multiplier.data.fill_(10)  # TODO: test different initializations
 
     def forward(self, x):
-        x = torch.sigmoid((x - self.bias) * self.multiplier)
-        x = torch.stack([x, 1 - x], dim=-1)
-        return x
+        index = torch.sigmoid((x - self.bias) * self.multiplier)
+        index = torch.stack([x, 1 - x], dim=-1)
+        return index
+
+    @classmethod
+    def index_into_embedding(cls, index, embedding: nn.Embedding):
+        return index @ embedding.weight
 
 
 class DiscreteEmbeddingIndex(nn.Module):
-    """Provides an embedding index for discrete values using one-hot encoding."""
+    """Provides an embedding index for discrete values."""
 
     def __init__(self, num_embeddings=2):
         super().__init__()
@@ -69,7 +51,25 @@ class DiscreteEmbeddingIndex(nn.Module):
         x = x * (self.num_embeddings - 1)  # assume 0 <= x <= 1
         x = torch.round(x)
         x = torch.clamp(x, 0, self.num_embeddings - 1)
-        return F.one_hot(x.long().squeeze(-1), self.num_embeddings).float()
+        return x.long().squeeze(-1)
+
+    @classmethod
+    def index_into_embedding(cls, index, embedding: nn.Embedding):
+        # return embedding(index)  # this is too slow
+        # return torch.index_select(embedding.weight, dim=0, index=index.view(-1)).view(index.shape + (-1,)) # this is also too slow
+        return F.one_hot(index, embedding.num_embeddings).float() @ embedding.weight
+
+
+class Embedder(nn.Module):
+    def __init__(self, embedding: nn.Embedding, index: Union[ContinuousEmbeddingIndex, DiscreteEmbeddingIndex], trainable_embeddings: bool = True):
+        super().__init__()
+        self.embedding = embedding
+        self.index = index
+        embedding.weight.requires_grad_(trainable_embeddings)
+
+    def forward(self, x):
+        index = self.index(x)
+        return self.index.index_into_embedding(index, self.embedding)
 
 
 class DistanceAwareMultiheadAttention(nn.Module):
@@ -123,22 +123,26 @@ class DistanceAwareMultiheadAttention(nn.Module):
 
         self.dropout = nn.Dropout(dropout)
 
+        EmbeddingIndex = ContinuousEmbeddingIndex if continuous else DiscreteEmbeddingIndex
+
+        self.index = EmbeddingIndex(num_embeddings=num_embeddings)
+
         if embed_keys:
-            self.embed_k = EmbeddingTable(
-                kdim // num_heads, num_embeddings=num_embeddings, trainable=trainable_embeddings)
+            self.embed_k = Embedder(
+                nn.Embedding(num_embeddings, kdim // num_heads),
+                index=self.index, trainable_embeddings=trainable_embeddings)
         if embed_queries:
-            self.embed_q = EmbeddingTable(
-                kdim // num_heads, num_embeddings=num_embeddings, trainable=trainable_embeddings)
+            self.embed_q = Embedder(
+                nn.Embedding(num_embeddings, kdim // num_heads),
+                index=self.index, trainable_embeddings=trainable_embeddings)
         if embed_values:
-            self.embed_v = EmbeddingTable(
-                vdim // num_heads, num_embeddings=num_embeddings, trainable=trainable_embeddings)
+            self.embed_v = Embedder(
+                nn.Embedding(num_embeddings, vdim // num_heads),
+                index=self.index, trainable_embeddings=trainable_embeddings)
 
         self.embed_keys = embed_keys
         self.embed_queries = embed_queries
         self.embed_values = embed_values
-
-        EmbeddingIndex = ContinuousEmbeddingIndex if continuous else DiscreteEmbeddingIndex
-        self.index_k = EmbeddingIndex(num_embeddings=num_embeddings)
 
         self._reset_parameters()
 
@@ -203,7 +207,7 @@ class DistanceAwareMultiheadAttention(nn.Module):
 
         # Term 1
         if self.embed_keys:
-            rk = self.embed_k(self.index_k(rel_dists)).unsqueeze(-4)
+            rk = self.embed_k(rel_dists).unsqueeze(-4)
             # rk is shape [Batch, 1, SeqLen, SeqLen, Dims]
             q_repeat = q.unsqueeze(-2)
             # q_repeat is shape [Batch, Head, SeqLen, 1, Dims]
@@ -212,7 +216,7 @@ class DistanceAwareMultiheadAttention(nn.Module):
 
         # Term 2
         if self.embed_queries:
-            rq = self.embed_q(self.index_k(rel_dists)).unsqueeze(-4)
+            rq = self.embed_q(rel_dists).unsqueeze(-4)
             # rq is shape [Batch, 1, SeqLen, SeqLen, Dims]
             k_repeat = k.unsqueeze(-3)
             # k_repeat is shape [Batch, Head, 1, SeqLen, Dims]
@@ -228,15 +232,26 @@ class DistanceAwareMultiheadAttention(nn.Module):
         A = A / d_k ** .5
         A = F.softmax(A, dim=-1)
 
-        A_dropout = self.dropout(A)
-        values = torch.matmul(A_dropout, v)
+        # Apply dropout
+        A_predropout = A
+        A = self.dropout(A)
+
+        # Apply attention to values
+        values = torch.matmul(A, v)
+
+        # Compute additional distance-aware term for values
+        if self.embed_values:
+            rv = self.embed_v(rel_dists).unsqueeze(-4)
+            # rv is shape [Batch, 1, SeqLen, SeqLen, Dims]
+            values = values + \
+                torch.einsum('bhqrd,bhqrd->bhqd', A.unsqueeze(-1), rv)
 
         # Unify heads
         values = values.permute(0, 2, 1, 3)  # [Batch, SeqLen, Head, Dims]
         values = values.reshape(batch_size, seq_length, -1)
 
         if need_weights:
-            return values, A_dropout
+            return values, A_predropout
         return values,
 
 
