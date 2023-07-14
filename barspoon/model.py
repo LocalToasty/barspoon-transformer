@@ -1,7 +1,7 @@
-import math
+# %%
 import re
 from collections.abc import Sequence
-from typing import Any, Tuple, Optional
+from typing import Any, Dict, Mapping, Optional, Tuple
 from functools import partial
 
 import numpy as np
@@ -18,8 +18,8 @@ from .pe.absolute import MaruPositionalEncodingLayer, AxialPositionalEncodingLay
 __all__ = [
     "LitEncDecTransformer",
     "EncDecTransformer",
-    "LitMilClassificaionMixin",
-    "TopKMuliLabelAUROC",
+    "LitMilClassificationMixin",
+    "SafeMulticlassAUROC",
 ]
 
 
@@ -61,16 +61,23 @@ class EncDecTransformer(nn.Module):
     both process the tiles' information and the class token's processing.  Using
     an encoder-decoder architecture alleviates these issues, as the data-flow of
     the class tokens is completely independent of the encoding of the tiles.
+    Furthermore, analysis has shown that there is almost no interaction between
+    the different classes in the decoder.  While this points to the decoder
+    being more powerful than needed in practice, this also means that each
+    label's prediction is mostly independent of the others.  As a consequence,
+    noisy labels will not negatively impact the accuracy of non-noisy ones.
 
     In our experiments so far we did not see any improvement by adding
     positional encodings.  We tried
+
      1. [Sinusodal encodings][1]
      2. Adding absolute positions to the feature vector, scaled down so the
         maximum value in the training dataset is 1.
-    Since neither reduced performance the author percieves the first one to be
-    more elegant (as it doesn't depend on the training set), we opted to keep
-    the positional encoding regardless in the hopes of it improving performance
-    on future tasks.
+
+    Since neither reduced performance and the author percieves the first one to
+    be more elegant (as the magnitude of the positional encodings is bounded),
+    we opted to keep the positional encoding regardless in the hopes of it
+    improving performance on future tasks.
 
     The architecture _differs_ from the one descibed in [Attention Is All You
     Need][1] as follows:
@@ -93,7 +100,7 @@ class EncDecTransformer(nn.Module):
     def __init__(
         self,
         d_features: int,
-        n_outs: Sequence[int],
+        target_n_outs: Dict[str, int],
         *,
         d_model: int = 512,
         num_encoder_heads: int = 8,
@@ -109,10 +116,6 @@ class EncDecTransformer(nn.Module):
             = 2  # must be 2 if relative_positional_encoding is "continuous"
     ) -> None:
         super().__init__()
-        n_targets = len(n_outs)
-
-        # One class token per output label
-        self.class_tokens = nn.Parameter(torch.rand(n_targets, d_model))
 
         self.projector = nn.Sequential(
             nn.Linear(d_features, d_model), nn.ReLU())
@@ -148,6 +151,12 @@ class EncDecTransformer(nn.Module):
         self.transformer_encoder = encoder_factory(
             encoder_layer, num_layers=num_encoder_layers
         )
+
+        # One class token per output label
+        self.class_tokens = nn.ParameterDict(
+            {target_label: torch.rand(d_model) for target_label in target_n_outs}
+        )
+
         decoder_layer = nn.TransformerDecoderLayer(
             d_model=d_model,
             nhead=num_decoder_heads,
@@ -159,12 +168,18 @@ class EncDecTransformer(nn.Module):
             decoder_layer, num_layers=num_decoder_layers
         )
 
-        self.heads = nn.ModuleList(
-            [nn.Linear(in_features=d_model, out_features=n_out)
-             for n_out in n_outs]
+        self.heads = nn.ModuleDict(
+            {
+                target_label: nn.Linear(in_features=d_model, out_features=n_out)
+                for target_label, n_out in target_n_outs.items()
+            }
         )
 
-    def forward(self, tile_tokens, tile_positions):
+    def forward(
+        self,
+        tile_tokens: torch.Tensor,
+        tile_positions: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
         batch_size, _, _ = tile_tokens.shape
 
         # shape: [bs, seq_len, d_model]
@@ -179,21 +194,21 @@ class EncDecTransformer(nn.Module):
             encoder_kwargs["tile_positions"] = tile_positions
         tile_tokens = self.transformer_encoder(tile_tokens, **encoder_kwargs)
 
-        class_tokens = self.class_tokens.expand(batch_size, -1, -1)
-        class_tokens = self.transformer_decoder(
-            tgt=class_tokens, memory=tile_tokens)
+        target_labels = list(self.class_tokens)
+        class_tokens = torch.stack(
+            [self.class_tokens[t] for t in target_labels]
+        ).expand(batch_size, -1, -1)
+        class_tokens = self.transformer_decoder(tgt=class_tokens, memory=tile_tokens)
 
         # Apply the corresponding head to each class token
-        logits = [
-            head(class_token)
-            for head, class_token in zip(
-                self.heads,
-                # Permute to [target, batch, d_model]
-                class_tokens.permute(1, 0, 2),
+        logits = {
+            target_label: self.heads[target_label](class_token)
+            for target_label, class_token in zip(
+                target_labels,
+                class_tokens.permute(1, 0, 2),  # Permute to [target, batch, d_model]
                 strict=True,
             )
-        ]
-        logits = torch.cat(logits, dim=-1)
+        }
 
         return logits
 
@@ -204,9 +219,8 @@ class LitMilClassificationMixin(pl.LightningModule):
     def __init__(
         self,
         *,
-        target_labels: Sequence[str],
-        weights: Sequence[torch.Tensor],
-        # other hparams
+        weights: Dict[str, torch.Tensor],
+        # Other hparams
         learning_rate: float = 1e-4,
         **hparams: Any,
     ) -> None:
@@ -218,7 +232,7 @@ class LitMilClassificationMixin(pl.LightningModule):
         target_aurocs = torchmetrics.MetricCollection(
             {
                 sanatize(target_label): SafeMulticlassAUROC(num_classes=len(weight))
-                for target_label, weight in zip(target_labels, weights)
+                for target_label, weight in weights.items()
             }
         )
         for step_name in ["train", "val", "test"]:
@@ -228,7 +242,6 @@ class LitMilClassificationMixin(pl.LightningModule):
                 target_aurocs.clone(prefix=f"{step_name}_"),
             )
 
-        self.target_labels = target_labels
         self.weights = weights
 
         self.save_hyperparameters()
@@ -237,21 +250,14 @@ class LitMilClassificationMixin(pl.LightningModule):
         feats, coords, targets = batch
         logits = self(feats, coords)
 
-        # The column ranges belonging to each target
-        target_edges = np.cumsum([0, *(len(w) for w in self.weights)])
         # Calculate the cross entropy loss for each target, then sum them
         loss = sum(
             F.cross_entropy(
-                logits[:, left:right],
-                targets[:, left:right].type_as(logits),
-                weight=weight.type_as(logits),
+                (l := logits[target_label]),
+                targets[target_label].type_as(l),
+                weight=weight.type_as(l),
             )
-            for left, right, weight in zip(
-                target_edges[:-1],  # Leftmost column belonging to target
-                target_edges[1:],  # Rightmost column belonging to target
-                self.weights,
-                strict=True,
-            )
+            for target_label, weight in self.weights.items()
         )
 
         if step_name:
@@ -265,19 +271,14 @@ class LitMilClassificationMixin(pl.LightningModule):
             )
 
             # Update target-wise metrics
-            for target_label, left, right in zip(
-                self.target_labels,
-                target_edges[:-1],
-                target_edges[1:],
-                strict=True,
-            ):
+            for target_label in self.weights:
                 target_auroc = getattr(self, f"{step_name}_target_aurocs")[
                     sanatize(target_label)
                 ]
-                is_na = (targets[:, left:right] == 0).all(dim=1)
+                is_na = (targets[target_label] == 0).all(dim=1)
                 target_auroc.update(
-                    logits[~is_na, left:right],
-                    targets[~is_na, left:right].argmax(dim=1),
+                    logits[target_label][~is_na],
+                    targets[target_label][~is_na].argmax(dim=1),
                 )
                 self.log(
                     f"{step_name}_{target_label}_auroc",
@@ -305,14 +306,9 @@ class LitMilClassificationMixin(pl.LightningModule):
             feats, positions, _ = batch
         logits = self(feats, positions)
 
-        target_edges = np.cumsum([0, *(len(w) for w in self.weights)])
-        softmaxed = torch.cat(
-            [
-                torch.softmax(logits[:, left:right], 1)
-                for left, right in zip(target_edges[:-1], target_edges[1:])
-            ],
-            dim=1,
-        )
+        softmaxed = {
+            target_label: torch.softmax(x, 1) for target_label, x in logits.items()
+        }
         return softmaxed
 
     def configure_optimizers(self):
@@ -345,8 +341,7 @@ class LitEncDecTransformer(LitMilClassificationMixin):
         self,
         *,
         d_features: int,
-        target_labels: Sequence[str],
-        weights: Sequence[torch.Tensor],
+        weights: Mapping[str, torch.Tensor],
         # Model parameters
         d_model: int = 512,
         num_encoder_heads: int = 8,
@@ -362,7 +357,6 @@ class LitEncDecTransformer(LitMilClassificationMixin):
         **hparams: Any,
     ) -> None:
         super().__init__(
-            target_labels=target_labels,
             weights=weights,
             learning_rate=learning_rate,
         )
@@ -370,7 +364,7 @@ class LitEncDecTransformer(LitMilClassificationMixin):
 
         self.model = EncDecTransformer(
             d_features=d_features,
-            n_outs=[len(w) for w in weights],
+            target_n_outs={t: len(w) for t, w in weights.items()},
             d_model=d_model,
             num_encoder_heads=num_encoder_heads,
             num_decoder_heads=num_decoder_heads,

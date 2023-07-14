@@ -3,7 +3,7 @@ import argparse
 import os
 import tomllib
 from pathlib import Path
-from typing import Iterable, Sequence, Tuple
+from typing import Iterable, Mapping, Sequence, Tuple
 
 import pytorch_lightning as pl
 import torch
@@ -15,7 +15,7 @@ from torch.utils.data import DataLoader
 from barspoon.data import BagDataset
 from barspoon.model import LitEncDecTransformer
 from barspoon.target_file import encode_targets
-from barspoon.utils import make_dataset_df, make_preds_df
+from barspoon.utils import flatten_batched_dicts, make_dataset_df, make_preds_df
 
 
 def main():
@@ -63,11 +63,11 @@ def main():
         train_items, valid_items = train_test_split(dataset_df.index, test_size=0.2)
         train_df, valid_df = dataset_df.loc[train_items], dataset_df.loc[valid_items]
 
-    train_encoded_targets, representatives, weights = encode_targets(
+    train_encoded_targets = encode_targets(
         train_df, target_labels=target_labels, **target_info
     )
 
-    valid_encoded_targets, _, _ = encode_targets(
+    valid_encoded_targets = encode_targets(
         valid_df, target_labels=target_labels, **target_info
     )
 
@@ -77,9 +77,9 @@ def main():
 
     train_dl, valid_dl = make_dataloaders(
         train_bags=train_df.path.values,
-        train_targets=train_encoded_targets,
+        train_targets={k: v.encoded for k, v in train_encoded_targets.items()},
         valid_bags=valid_df.path.values,
-        valid_targets=valid_encoded_targets,
+        valid_targets={k: v.encoded for k, v in valid_encoded_targets.items()},
         instances_per_bag=args.instances_per_bag,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
@@ -91,10 +91,10 @@ def main():
     model = LitEncDecTransformer(
         d_features=d_features,
         target_labels=target_labels,
-        weights=weights,
+        weights={k: v.weight for k, v in train_encoded_targets.items()},
         # Other hparams
-        version="barspoon-transformer 2.0",
-        categories=representatives,
+        version="barspoon-transformer 3.0",
+        categories={k: v.categories for k, v in train_encoded_targets.items()},
         target_file=target_info,
         **{
             f"train_{train_df.index.name}": list(train_df.index),
@@ -128,12 +128,14 @@ def main():
 
     trainer.fit(model=model, train_dataloaders=train_dl, val_dataloaders=valid_dl)
 
-    predictions = torch.cat(trainer.predict(model=model, dataloaders=valid_dl, return_predictions=True))  # type: ignore
+    predictions = flatten_batched_dicts(
+        trainer.predict(model=model, dataloaders=valid_dl, return_predictions=True)
+    )
+
     preds_df = make_preds_df(
         predictions=predictions,
         base_df=valid_df,
-        target_labels=target_labels,
-        categories=representatives,
+        categories={k: v.categories for k, v in train_encoded_targets.items()},
     )
     preds_df.to_csv(args.output_dir / "valid-patient-preds.csv")
 
@@ -267,9 +269,9 @@ def make_argument_parser() -> argparse.ArgumentParser:
 def make_dataloaders(
     *,
     train_bags: Sequence[Iterable[Path]],
-    train_targets: torch.Tensor,
+    train_targets: Mapping[str, torch.Tensor],
     valid_bags: Sequence[Iterable[Path]],
-    valid_targets: torch.Tensor,
+    valid_targets: Mapping[str, torch.Tensor],
     batch_size: int,
     instances_per_bag: int,
     num_workers: int,

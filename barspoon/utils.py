@@ -1,6 +1,6 @@
 import logging
 from pathlib import Path
-from typing import Iterable, Literal, Optional, Sequence, Union
+from typing import Dict, Iterable, Literal, Mapping, Optional, Sequence, Union
 
 import numpy as np
 import pandas as pd
@@ -11,6 +11,7 @@ __all__ = [
     "read_table",
     "make_preds_df",
     "note_problem",
+    "flatten_batched_dicts",
 ]
 
 
@@ -113,32 +114,26 @@ def read_table(table: Union[Path, pd.DataFrame], dtype=str) -> pd.DataFrame:
 
 
 def make_preds_df(
-    predictions: torch.Tensor,
+    predictions: Mapping[str, torch.Tensor],
     *,
     base_df: pd.DataFrame,
-    target_labels: Sequence[str],
-    categories: Sequence[str],
+    categories: Mapping[str, Sequence[str]],
 ) -> pd.DataFrame:
-    assert len(target_labels) == len(categories)
-
-    target_edges = np.cumsum([0, *(len(c) for c in categories)])
-
     target_pred_dfs = []
-    for target_label, cat_labels, left, right in zip(
-        target_labels, categories, target_edges[:-1], target_edges[1:]
-    ):
+    for target_label, cat_labels in categories.items():
         target_pred_df = pd.DataFrame(
-            predictions[:, left:right],
+            predictions[target_label],
             columns=[f"{target_label}_{cat}" for cat in cat_labels],
             index=base_df.index,
         )
-        hard_prediction = np.array(cat_labels)[predictions[:, left:right].argmax(dim=1)]
+        hard_prediction = np.array(cat_labels)[predictions[target_label].argmax(dim=1)]
         target_pred_df[f"{target_label}_pred"] = hard_prediction
 
         target_pred_dfs.append(target_pred_df)
 
     preds_df = pd.concat(
-        [base_df.loc[:, base_df.columns.isin(target_labels)], *target_pred_dfs], axis=1
+        [base_df.loc[:, base_df.columns.isin(categories.keys())], *target_pred_dfs],
+        axis=1,
     ).copy()
     return preds_df
 
@@ -152,3 +147,15 @@ def note_problem(msg, mode: Literal["raise", "warn", "ignore"]):
         return
     else:
         raise ValueError("unknown error propagation type", mode)
+
+
+def flatten_batched_dicts(
+    dicts: Sequence[Dict[str, torch.Tensor]]
+) -> Dict[str, torch.Tensor]:
+    # `trainer.predict` gives us a bunch of dictionaries, with `target_labels`
+    # as keys and `batch_size` predictions each.  We reconstruct it into a
+    # single dict with `target_labels` as the keys and _all_ predictions for
+    # that label as values.
+    keys = list(dicts[0].keys())
+
+    return {k: torch.cat([x[k] for x in dicts]) for k in keys}

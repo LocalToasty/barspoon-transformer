@@ -10,7 +10,7 @@ from torch.utils.data import DataLoader
 
 from barspoon.data import BagDataset
 from barspoon.model import LitEncDecTransformer
-from barspoon.utils import make_dataset_df, make_preds_df
+from barspoon.utils import flatten_batched_dicts, make_dataset_df, make_preds_df
 
 
 def main():
@@ -25,11 +25,10 @@ def main():
     name, version = model.hparams.get("version", "undefined 0").split(" ")
     if not (
         name == "barspoon-transformer"
-        and (spec := SpecifierSet(">=1.0,<3")).contains(version)
+        and (spec := SpecifierSet(">=3.0,<4")).contains(version)
     ):
         raise ValueError(
-            f"model not compatible. Found {name} {version}, expected barspoon-transformer {spec}",
-            model.hparams["version"],
+            f"model not compatible. Found {name} {version}, expected barspoon-transformer {spec}"
         )
 
     target_labels = model.hparams["target_labels"]
@@ -47,7 +46,7 @@ def main():
     # Make a dataset with faux labels (the labels will be ignored)
     ds = BagDataset(
         bags=list(dataset_df.path),
-        targets=torch.zeros(len(dataset_df), 0),
+        targets={},
         instances_per_bag=None,
     )
     dl = DataLoader(ds, shuffle=False, num_workers=args.num_workers)
@@ -59,12 +58,12 @@ def main():
         default_root_dir=args.output_dir,
         accelerator=args.accelerator,
         devices=1,
+        logger=False,
     )
-    predictions = torch.cat(trainer.predict(model=model, dataloaders=dl))  # type: ignore
+    predictions = flatten_batched_dicts(trainer.predict(model=model, dataloaders=dl))
     preds_df = make_preds_df(
         predictions=predictions,
         base_df=dataset_df.drop(columns="path"),
-        target_labels=target_labels,
         categories=model.hparams["categories"],
     )
 
