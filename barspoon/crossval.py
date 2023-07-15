@@ -41,7 +41,7 @@ def main():
     )
 
     for fold_no, (train_idx, valid_idx, test_idx) in enumerate(
-        get_splits(dataset_df.index.values)
+        get_splits(dataset_df.index.values, n_splits=args.num_splits)
     ):
         fold_dir = args.output_dir / f"{fold_no=}"
         fold_dir.mkdir(exist_ok=True, parents=True)
