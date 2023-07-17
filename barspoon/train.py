@@ -243,6 +243,12 @@ def make_argument_parser() -> argparse.ArgumentParser:
     model_parser.add_argument("--num-decoder-layers", type=int, default=2)
     model_parser.add_argument("--d-model", type=int, default=512)
     model_parser.add_argument("--dim-feedforward", type=int, default=2048)
+    model_parser.add_argument("--abs-pos-enc", type=str, choices=["maru", "axial", "fourier"], 
+                              default=None, dest="absolute_positional_encoding")
+    model_parser.add_argument("--rel-pos-enc", type=str, choices=["continuous", "discrete"], 
+                              default=None, dest="relative_positional_encoding")
+    model_parser.add_argument("--rel-pos-enc-bins", type=int,
+                              default=2, dest="relative_positional_encoding_bins")
 
     training_parser = parser.add_argument_group("training options")
     training_parser.add_argument("--instances-per-bag", type=int, default=2**12)

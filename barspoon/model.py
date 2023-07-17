@@ -1,5 +1,8 @@
 # %%
-from typing import Any, Dict, Mapping, Tuple
+import re
+from collections.abc import Sequence
+from typing import Any, Dict, Mapping, Optional, Tuple
+from functools import partial
 
 import re
 import pytorch_lightning as pl
@@ -8,6 +11,9 @@ import torch.nn.functional as F
 import torchmetrics
 from torch import Tensor, nn
 from torchmetrics.utilities.data import dim_zero_cat
+
+from .pe.relative import DistanceAwareTransformerEncoder, DistanceAwareTransformerEncoderLayer
+from .pe.absolute import MaruPositionalEncodingLayer, AxialPositionalEncodingLayer, FourierPositionalEncodingLayer
 
 __all__ = [
     "LitEncDecTransformer",
@@ -102,19 +108,47 @@ class EncDecTransformer(nn.Module):
         num_encoder_layers: int = 2,
         num_decoder_layers: int = 2,
         dim_feedforward: int = 2048,
+        absolute_positional_encoding: Optional[str]
+            = None,  # "maru", "axial", "fourier"
+        relative_positional_encoding: Optional[str]
+            = None,  # "discrete" or "continuous"
+        relative_positional_encoding_bins: int
+            = 2  # must be 2 if relative_positional_encoding is "continuous"
     ) -> None:
         super().__init__()
 
-        self.projector = nn.Sequential(nn.Linear(d_features, d_model), nn.ReLU())
+        self.projector = nn.Sequential(
+            nn.Linear(d_features, d_model), nn.ReLU())
 
-        encoder_layer = nn.TransformerEncoderLayer(
+        self.absolute_positional_encoding_layer = {
+            "maru": MaruPositionalEncodingLayer,
+            "axial": AxialPositionalEncodingLayer,
+            "fourier": FourierPositionalEncodingLayer,
+        }.get(absolute_positional_encoding, lambda _: None)(d_model)
+
+        self.relative_positional_encoding = relative_positional_encoding
+
+        # Define the type of encoder to use
+        encoder_layer_factory = nn.TransformerEncoderLayer
+        encoder_factory = nn.TransformerEncoder
+        if relative_positional_encoding:
+            assert relative_positional_encoding != "continuous" or relative_positional_encoding_bins == 2, \
+                "Relative positional encoding with continuous bins must have 2 bins"
+            encoder_layer_factory = partial(
+                DistanceAwareTransformerEncoderLayer,
+                continuous=relative_positional_encoding == "continuous",
+                bins=relative_positional_encoding_bins,
+            )
+            encoder_factory = DistanceAwareTransformerEncoder
+
+        encoder_layer = encoder_layer_factory(
             d_model=d_model,
             nhead=num_encoder_heads,
             dim_feedforward=dim_feedforward,
             batch_first=True,
             norm_first=True,
         )
-        self.transformer_encoder = nn.TransformerEncoder(
+        self.transformer_encoder = encoder_factory(
             encoder_layer, num_layers=num_encoder_layers
         )
 
@@ -150,23 +184,17 @@ class EncDecTransformer(nn.Module):
     ) -> Dict[str, torch.Tensor]:
         batch_size, _, _ = tile_tokens.shape
 
-        tile_tokens = self.projector(tile_tokens)  # shape: [bs, seq_len, d_model]
+        # shape: [bs, seq_len, d_model]
+        tile_tokens = self.projector(tile_tokens)
 
         # Add positional encodings
-        d_model = tile_tokens.size(-1)
-        x = tile_positions.unsqueeze(-1) / 100_000 ** (
-            torch.arange(d_model // 4).type_as(tile_positions) / d_model
-        )
-        positional_encodings = torch.cat(
-            [
-                torch.sin(x).flatten(start_dim=-2),
-                torch.cos(x).flatten(start_dim=-2),
-            ],
-            dim=-1,
-        )
-        tile_tokens = tile_tokens + positional_encodings
+        if self.absolute_positional_encoding_layer:
+            tile_tokens = self.absolute_positional_encoding_layer(tile_tokens, tile_positions)
 
-        tile_tokens = self.transformer_encoder(tile_tokens)
+        encoder_kwargs = dict()
+        if isinstance(self.transformer_encoder, DistanceAwareTransformerEncoder):
+            encoder_kwargs["tile_positions"] = tile_positions
+        tile_tokens = self.transformer_encoder(tile_tokens, **encoder_kwargs)
 
         class_tokens = torch.stack(
             [self.class_tokens[sanitize(t)] for t in self.target_labels]
@@ -299,7 +327,8 @@ class SafeMulticlassAUROC(torchmetrics.classification.MulticlassAUROC):
     def compute(self) -> torch.Tensor:
         # Add faux entry if there are none so far
         if len(self.preds) == 0:
-            self.update(torch.zeros(1, self.num_classes), torch.zeros(1).long())
+            self.update(torch.zeros(1, self.num_classes),
+                        torch.zeros(1).long())
         elif len(dim_zero_cat(self.preds)) == 0:
             self.update(
                 torch.zeros(1, self.num_classes).type_as(self.preds[0]),
@@ -323,6 +352,9 @@ class LitEncDecTransformer(LitMilClassificationMixin):
         dim_feedforward: int = 2048,
         # Other hparams
         learning_rate: float = 1e-4,
+        absolute_positional_encoding: Optional[str] = None,
+        relative_positional_encoding: Optional[str] = None,
+        relative_positional_encoding_bins: int = 2,
         **hparams: Any,
     ) -> None:
         super().__init__(
@@ -340,6 +372,9 @@ class LitEncDecTransformer(LitMilClassificationMixin):
             num_encoder_layers=num_encoder_layers,
             num_decoder_layers=num_decoder_layers,
             dim_feedforward=dim_feedforward,
+            absolute_positional_encoding=absolute_positional_encoding,
+            relative_positional_encoding=relative_positional_encoding,
+            relative_positional_encoding_bins=relative_positional_encoding_bins,
         )
 
         self.save_hyperparameters()
