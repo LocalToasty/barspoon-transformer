@@ -1,5 +1,5 @@
 from collections.abc import Iterable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Mapping, Optional, Tuple
 
@@ -22,8 +22,11 @@ class BagDataset(Dataset):
     where N is the number of instances and F the number of features per instance.
     """
     targets: Mapping[str, torch.Tensor]
+
+    additional_inputs: Mapping[str, torch.Tensor]
+
     """The label of each bag"""
-    instances_per_bag: Optional[int]
+    instances_per_bag: Optional[int] = None
     """The number of instances to sample, or all samples if None"""
     deterministic: bool = True
     """Whether to sample deterministically
@@ -39,6 +42,10 @@ class BagDataset(Dataset):
     during runtime if features extracted with different feature extractors are
     encountered in the dataset.
     """
+
+    def __post_init__(self) -> None:
+        assert all(len(self.bags) == len(t) for t in self.targets.values())
+        assert all(len(self.bags) == len(a) for a in self.additional_inputs.values())
 
     def __len__(self):
         return len(self.bags)
@@ -96,6 +103,7 @@ class BagDataset(Dataset):
             feats,
             coords,
             {label: target[index] for label, target in self.targets.items()},
+            {label: value[index] for label, value in self.additional_inputs.items()},
         )
 
 

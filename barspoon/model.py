@@ -1,6 +1,6 @@
-# %%
+import random
 import re
-from typing import Any, Dict, Mapping, Tuple
+from typing import Any, Dict, Mapping, Optional, Tuple
 
 import pytorch_lightning as pl
 import torch
@@ -25,21 +25,33 @@ class EncDecTransformer(nn.Module):
     feature space, to prevent the transformer architecture's complexity from
     exploding for high-dimensional features.  We add sinusodial [positional
     encodings][1].  We then encode these projected input tokens using a
-    transformer encoder stack.  Next, we decode these tokens using a set of
-    class tokens, one per output label.  Finally, we forward each of the decoded
-    tokens through a fully connected layer to get a label-wise prediction.
+    transformer encoder stack.  Additional tabular data is also encoded into
+    tokens using a stack of to fully connected layers per label.  These encoded
+    tokens are then concatenated to the sequene of encoded tile tokens.  Next,
+    we decode these tokens using a set of class tokens, one per output label.
+    Finally, we forward each of the decoded tokens through a fully connected
+    layer to get a label-wise prediction.
 
                   PE1
                    |
              +--+  v   +---+
-        t1 --|FC|--+-->|   |--+
+        t1 ->|FC|--+-->|   |--+     // Encoded tile tokens
          .   +--+      | E |  |
          .             | x |  |
          .   +--+      | n |  |
-        tn --|FC|--+-->|   |--+
+        tn ->|FC|--+-->|   |--+
              +--+  ^   +---+  |
                    |          |
-                  PEn         v
+                  PEn         |
+                              |
+             +---+            |
+        a1 ->|AE1|------------+     // Encoded tabular data tokens
+         .   +---+            |
+         .                    |
+         .   +---+            |
+        am ->|AEm|------------+
+             +---+            |
+                              v
                             +---+   +---+
         c1 ---------------->|   |-->|FC1|--> s1
          .                  | D |   +---+     .
@@ -102,6 +114,7 @@ class EncDecTransformer(nn.Module):
         num_encoder_layers: int = 2,
         num_decoder_layers: int = 2,
         dim_feedforward: int = 2048,
+        additional_encoders: Optional[Mapping[str, nn.Module]] = None,
         positional_encoding: bool = True,
     ) -> None:
         super().__init__()
@@ -129,6 +142,11 @@ class EncDecTransformer(nn.Module):
             }
         )
 
+        if additional_encoders:
+            self.additional_encoders = nn.ModuleDict(
+                {sanitize(k): v for k, v in additional_encoders.items()}
+            )
+
         decoder_layer = nn.TransformerDecoderLayer(
             d_model=d_model,
             nhead=num_decoder_heads,
@@ -155,8 +173,11 @@ class EncDecTransformer(nn.Module):
         self,
         tile_tokens: torch.Tensor,
         tile_positions: torch.Tensor,
+        additional_features,
     ) -> Dict[str, torch.Tensor]:
         batch_size, _, _ = tile_tokens.shape
+
+        # Encoder stage
 
         tile_tokens = self.projector(tile_tokens)  # shape: [bs, seq_len, d_model]
 
@@ -175,12 +196,34 @@ class EncDecTransformer(nn.Module):
             )
             tile_tokens = tile_tokens + positional_encodings
 
+        # Grab both the tile tokens as well as the additional tokens and put
+        # aggregate them in a single tensor
+
         tile_tokens = self.transformer_encoder(tile_tokens)
+
+        if additional_features:
+            additional_tokens = torch.cat(
+                [
+                    self.additional_encoders[sanitize(label)](
+                        x.type_as(tile_tokens)
+                    ).unsqueeze(
+                        -2
+                    )  # shape: [bs, 1, d_model]
+                    for label, x in additional_features.items()
+                ],
+                dim=-2,
+            )  # shape: [bs, len(additional_features), d_model]
+
+            memory = torch.cat([tile_tokens, additional_tokens], dim=-2)
+        else:
+            memory = tile_tokens
+
+        # Decoder stage
 
         class_tokens = torch.stack(
             [self.class_tokens[sanitize(t)] for t in self.target_labels]
         ).expand(batch_size, -1, -1)
-        class_tokens = self.transformer_decoder(tgt=class_tokens, memory=tile_tokens)
+        class_tokens = self.transformer_decoder(tgt=class_tokens, memory=memory)
 
         # Apply the corresponding head to each class token
         logits = {
@@ -229,8 +272,24 @@ class LitMilClassificationMixin(pl.LightningModule):
         self.save_hyperparameters()
 
     def step(self, batch: Tuple[Tensor, Tensor], step_name=None):
-        feats, coords, targets = batch
-        logits = self(feats, coords)
+        feats, coords, targets, additional_features = batch
+
+        if step_name == "train":
+            selected_additional_features = set(
+                random.sample(
+                    sorted(additional_features),
+                    k=int(random.random() * len(additional_features)),
+                )
+            )
+        else:
+            selected_additional_features = {}
+        logits = self(
+            feats,
+            coords,
+            additional_features={
+                k: additional_features[k] for k in selected_additional_features
+            },
+        )
 
         # Calculate the cross entropy loss for each target, then sum them
         loss = sum(
@@ -240,6 +299,7 @@ class LitMilClassificationMixin(pl.LightningModule):
                 weight=weight.type_as(l),
             )
             for target_label, weight in self.weights.items()
+            if target_label not in selected_additional_features
         )
 
         if step_name:
@@ -273,20 +333,24 @@ class LitMilClassificationMixin(pl.LightningModule):
         return loss
 
     def training_step(self, batch, batch_idx):
+        _ = batch_idx  # Unused
         return self.step(batch, step_name="train")
 
     def validation_step(self, batch, batch_idx):
+        _ = batch_idx  # Unused
         return self.step(batch, step_name="val")
 
     def test_step(self, batch, batch_idx):
+        _ = batch_idx  # Unused
         return self.step(batch, step_name="test")
 
     def predict_step(self, batch, batch_idx, dataloader_idx=0):
+        _, _ = batch_idx, dataloader_idx  # Unused
         if len(batch) == 2:
-            feats, positions = batch
+            feats, positions, additional_features = batch
         else:
-            feats, positions, _ = batch
-        logits = self(feats, positions)
+            feats, positions, _, additional_features = batch
+        logits = self(feats, positions, additional_features=additional_features)
 
         softmaxed = {
             target_label: torch.softmax(x, 1) for target_label, x in logits.items()
@@ -331,6 +395,8 @@ class LitEncDecTransformer(LitMilClassificationMixin):
         num_decoder_layers: int = 2,
         dim_feedforward: int = 2048,
         positional_encoding: bool = True,
+        # Additional Modalities
+        additional_inputs: Optional[Mapping[str, int]] = None,
         # Other hparams
         learning_rate: float = 1e-4,
         **hparams: Any,
@@ -339,7 +405,7 @@ class LitEncDecTransformer(LitMilClassificationMixin):
             weights=weights,
             learning_rate=learning_rate,
         )
-        _ = hparams  # so we don't get unused parameter warnings
+        _ = hparams  # So we don't get unused parameter warnings
 
         self.model = EncDecTransformer(
             d_features=d_features,
@@ -351,9 +417,22 @@ class LitEncDecTransformer(LitMilClassificationMixin):
             num_decoder_layers=num_decoder_layers,
             dim_feedforward=dim_feedforward,
             positional_encoding=positional_encoding,
+            additional_encoders={
+                label: nn.Sequential(
+                    nn.Linear(
+                        in_features=n_feats, out_features=(n_feats + d_model) // 2
+                    ),
+                    nn.ReLU(),
+                    nn.Dropout(0.1),
+                    nn.Linear(
+                        in_features=(n_feats + d_model) // 2, out_features=d_model
+                    ),
+                )
+                for label, n_feats in (additional_inputs or {}).items()
+            },
         )
 
         self.save_hyperparameters()
 
-    def forward(self, *args):
-        return self.model(*args)
+    def forward(self, *args, **kwargs):
+        return self.model(*args, **kwargs)

@@ -14,7 +14,7 @@ from torch.utils.data import DataLoader
 
 from barspoon.data import BagDataset
 from barspoon.model import LitEncDecTransformer
-from barspoon.target_file import encode_targets
+from barspoon.target_file import encode
 from barspoon.utils import flatten_batched_dicts, make_dataset_df, make_preds_df
 
 
@@ -28,9 +28,16 @@ def main():
     with open(args.target_file, "rb") as target_toml_file:
         target_info = tomli.load(target_toml_file)
     target_labels = list(target_info["targets"].keys())
+    additional_labels = list(target_info["additional_inputs"].keys())
+
+    assert not (
+        set(target_labels) & set(additional_labels)
+    ), "input and output labels must not overlap"
+
+    labels_to_keep = set(target_labels) | set(additional_labels)
 
     if args.valid_clini_tables or args.valid_slide_tables or args.valid_feature_dirs:
-        # read validation set from separate clini / slide table / feature dir
+        # Read validation set from separate clini / slide table / feature dir
         train_df = make_dataset_df(
             clini_tables=args.clini_tables,
             slide_tables=args.slide_tables,
@@ -38,7 +45,7 @@ def main():
             patient_col=args.patient_col,
             filename_col=args.filename_col,
             group_by=args.group_by,
-            target_labels=target_labels,
+            labels_to_keep=labels_to_keep,
         )
         valid_df = make_dataset_df(
             clini_tables=args.valid_clini_tables or args.clini_tables,
@@ -47,10 +54,10 @@ def main():
             patient_col=args.patient_col,
             filename_col=args.filename_col,
             group_by=args.group_by,
-            target_labels=target_labels,
+            labels_to_keep=labels_to_keep,
         )
     else:
-        # split validation set off main dataset
+        # Split validation set off main dataset
         dataset_df = make_dataset_df(
             clini_tables=args.clini_tables,
             slide_tables=args.slide_tables,
@@ -58,18 +65,13 @@ def main():
             patient_col=args.patient_col,
             filename_col=args.filename_col,
             group_by=args.group_by,
-            target_labels=target_labels,
+            labels_to_keep=labels_to_keep,
         )
         train_items, valid_items = train_test_split(dataset_df.index, test_size=0.2)
         train_df, valid_df = dataset_df.loc[train_items], dataset_df.loc[valid_items]
 
-    train_encoded_targets = encode_targets(
-        train_df, target_labels=target_labels, **target_info
-    )
-
-    valid_encoded_targets = encode_targets(
-        valid_df, target_labels=target_labels, **target_info
-    )
+    train_encoded_targets, train_additional_inputs = encode(train_df, **target_info)
+    valid_encoded_targets, valid_additional_inputs = encode(valid_df, **target_info)
 
     assert not (
         overlap := set(train_df.index) & set(valid_df.index)
@@ -78,22 +80,29 @@ def main():
     train_dl, valid_dl = make_dataloaders(
         train_bags=train_df.path.values,
         train_targets={k: v.encoded for k, v in train_encoded_targets.items()},
+        train_additional_inputs={
+            k: v.encoded for k, v in train_additional_inputs.items()
+        },
         valid_bags=valid_df.path.values,
         valid_targets={k: v.encoded for k, v in valid_encoded_targets.items()},
+        valid_additional_inputs={
+            k: v.encoded for k, v in valid_additional_inputs.items()
+        },
         instances_per_bag=args.instances_per_bag,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
     )
 
-    example_bags, _, _ = next(iter(train_dl))
+    example_bags, _, _, additional_features = next(iter(train_dl))
     d_features = example_bags.size(-1)
 
     model = LitEncDecTransformer(
         d_features=d_features,
         target_labels=target_labels,
         weights={k: v.weight for k, v in train_encoded_targets.items()},
+        additional_inputs={k: v.shape[-1] for k, v in additional_features.items()},
         # Other hparams
-        version="barspoon-transformer 3.1",
+        version="barspoon-transformer 4.0",
         categories={k: v.categories for k, v in train_encoded_targets.items()},
         target_file=target_info,
         **{
@@ -267,8 +276,10 @@ def make_dataloaders(
     *,
     train_bags: Sequence[Iterable[Path]],
     train_targets: Mapping[str, torch.Tensor],
+    train_additional_inputs: Mapping[str, torch.Tensor],
     valid_bags: Sequence[Iterable[Path]],
     valid_targets: Mapping[str, torch.Tensor],
+    valid_additional_inputs: Mapping[str, torch.Tensor],
     batch_size: int,
     instances_per_bag: int,
     num_workers: int,
@@ -276,6 +287,7 @@ def make_dataloaders(
     train_ds = BagDataset(
         bags=train_bags,
         targets=train_targets,
+        additional_inputs=train_additional_inputs,
         instances_per_bag=instances_per_bag,
         deterministic=False,
     )
@@ -286,6 +298,7 @@ def make_dataloaders(
     valid_ds = BagDataset(
         bags=valid_bags,
         targets=valid_targets,
+        additional_inputs=valid_additional_inputs,
         instances_per_bag=instances_per_bag,
         deterministic=True,
     )

@@ -54,8 +54,10 @@ import torch
 from packaging.specifiers import SpecifierSet
 from PIL import Image
 from PIL.PngImagePlugin import PngInfo
+from torch.utils.data import DataLoader
 from tqdm import tqdm
 
+from barspoon.data import BagDataset
 from barspoon.model import LitEncDecTransformer
 from barspoon.utils import make_dataset_df
 
@@ -73,22 +75,39 @@ def main():
     name, version = model.hparams.get("version", "undefined 0").split(" ")
     if not (
         name == "barspoon-transformer"
-        and (spec := SpecifierSet(">=3.0,<4")).contains(version)
+        and (spec := SpecifierSet("~=4.0")).contains(version)
     ):
         raise ValueError(
             f"model not compatible. Found {name} {version}, expected barspoon-transformer {spec}",
             model.hparams["version"],
         )
 
-    target_labels = model.hparams["target_labels"]
+    additional_labels = model.hparams["additional_inputs"].keys()
 
     # Load dataset, grouped by filename
     dataset_df = make_dataset_df(
+        clini_tables=args.clini_tables,
+        slide_tables=args.slide_tables,
         feature_dirs=args.feature_dirs,
-        target_labels=target_labels,
+        patient_col=args.patient_col,
+        filename_col=args.filename_col,
+        group_by=args.filename_col,
+        labels_to_keep=model.hparams["additional_inputs"].keys(),
     )
 
-    for slides in tqdm(dataset_df.path):
+    valid_additional_inputs = encode(dataset_df, **target_info)
+
+    # Make a dataset with faux labels (the labels will be ignored)
+    ds = BagDataset(
+        bags=list(dataset_df.path),
+        targets={},
+        additional_inputs={k: v.encoded for k, v in additional_inputs.items()},
+        instances_per_bag=None,
+    )
+    dl = DataLoader(ds, shuffle=False, num_workers=args.num_workers)
+
+    for slides, batch in tqdm(dataset_df.path, dl):
+        breakpoint()
         assert (
             len(slides) == 1
         ), "there should only be one slide per item after grouping by slidename"
@@ -309,6 +328,24 @@ def make_argument_parser() -> argparse.ArgumentParser:
     )
 
     parser.add_argument(
+        "-c",
+        "--clini-table",
+        metavar="CLINI_TABLE",
+        dest="clini_tables",
+        type=Path,
+        action="append",
+        help="Path to the clinical table. Can be specified multiple times",
+    )
+    parser.add_argument(
+        "-s",
+        "--slide-table",
+        dest="slide_tables",
+        metavar="SLIDE_TABLE",
+        type=Path,
+        action="append",
+        help="Path to the slide table. Can be specified multiple times",
+    )
+    parser.add_argument(
         "-f",
         "--feature-dir",
         metavar="FEATURE_DIR",
@@ -325,6 +362,21 @@ def make_argument_parser() -> argparse.ArgumentParser:
         type=Path,
         required=True,
         help="Path to the checkpoint file",
+    )
+
+    parser.add_argument(
+        "--patient-col",
+        metavar="COL",
+        type=str,
+        default="patient",
+        help="Name of the patient column",
+    )
+    parser.add_argument(
+        "--filename-col",
+        metavar="COL",
+        type=str,
+        default="filename",
+        help="Name of the slide column",
     )
 
     parser.add_argument("--batch-size", type=int, default=0x20)

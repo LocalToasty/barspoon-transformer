@@ -10,7 +10,6 @@ __all__ = [
     "make_dataset_df",
     "read_table",
     "make_preds_df",
-    "note_problem",
     "flatten_batched_dicts",
 ]
 
@@ -23,7 +22,7 @@ def make_dataset_df(
     patient_col: str = "patient",
     filename_col: str = "filename",
     group_by: Optional[str] = None,
-    target_labels: Sequence[str],
+    labels_to_keep: Iterable[str],
 ) -> pd.DataFrame:
     if slide_tables:
         slide_dfs = []
@@ -44,9 +43,8 @@ def make_dataset_df(
             )
 
             if (na_idxs := slide_df.path.isna()).any():
-                note_problem(
-                    f"some slides from {slide_table} have no features: {list(slide_df.loc[na_idxs, filename_col])}",
-                    "warn",
+                logging.warn(
+                    f"some slides from {slide_table} have no features: {list(slide_df.loc[na_idxs, filename_col])}"
                 )
             slide_df = slide_df[~na_idxs]
             slide_dfs.append(slide_df)
@@ -60,7 +58,8 @@ def make_dataset_df(
         df = pd.DataFrame(list(h5s), columns=["path"])
         df[filename_col] = df.path.map(lambda p: p.name)
 
-    # df is now a DataFrame containing at least a column "path", possibly a patient and filename column
+    # `df` is now a DataFrame containing at least a column "path", possibly a
+    # patient and filename column
 
     if clini_tables:
         assert patient_col in df.columns, (
@@ -74,7 +73,7 @@ def make_dataset_df(
         clini_df = (
             # select all important columns
             clini_df.loc[
-                :, clini_df.columns.isin([patient_col, group_by, *target_labels])  # type: ignore
+                :, clini_df.columns.isin([patient_col, group_by, *labels_to_keep])  # type: ignore
             ]
             .drop_duplicates()
             .set_index(patient_col, verify_integrity=True)
@@ -136,17 +135,6 @@ def make_preds_df(
         axis=1,
     ).copy()
     return preds_df
-
-
-def note_problem(msg, mode: Literal["raise", "warn", "ignore"]):
-    if mode == "raise":
-        raise RuntimeError(msg)
-    elif mode == "warn":
-        logging.warning(msg)
-    elif mode == "ignore":
-        return
-    else:
-        raise ValueError("unknown error propagation type", mode)
 
 
 def flatten_batched_dicts(

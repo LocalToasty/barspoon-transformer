@@ -10,6 +10,7 @@ from torch.utils.data import DataLoader
 
 from barspoon.data import BagDataset
 from barspoon.model import LitEncDecTransformer
+from barspoon.target_file import encode
 from barspoon.utils import flatten_batched_dicts, make_dataset_df, make_preds_df
 
 
@@ -25,13 +26,14 @@ def main():
     name, version = model.hparams.get("version", "undefined 0").split(" ")
     if not (
         name == "barspoon-transformer"
-        and (spec := SpecifierSet(">=3.0,<4")).contains(version)
+        and (spec := SpecifierSet("~=4.0")).contains(version)
     ):
         raise ValueError(
-            f"model not compatible. Found {name} {version}, expected barspoon-transformer {spec}"
+            f"model not compatible. Found {name} {version}, expected barspoon-transformer{spec}"
         )
 
     target_labels = model.hparams["target_labels"]
+    additional_inputs = model.hparams["additional_inputs"].keys()
 
     dataset_df = make_dataset_df(
         clini_tables=args.clini_tables,
@@ -40,13 +42,16 @@ def main():
         patient_col=args.patient_col,
         filename_col=args.filename_col,
         group_by=args.group_by,
-        target_labels=target_labels,
+        labels_to_keep=set(target_labels) | set(additional_inputs),
     )
+
+    _, additional_inputs = encode(dataset_df, **model.hparams["target_file"])
 
     # Make a dataset with faux labels (the labels will be ignored)
     ds = BagDataset(
         bags=list(dataset_df.path),
         targets={},
+        additional_inputs={k: v.encoded for k, v in additional_inputs.items()},
         instances_per_bag=None,
     )
     dl = DataLoader(ds, shuffle=False, num_workers=args.num_workers)

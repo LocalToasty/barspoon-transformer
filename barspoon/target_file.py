@@ -1,6 +1,6 @@
 """Automatically generate target information from clini table
 
-# The `barspoon-targets 2.0` File Format
+# The `barspoon-targets 3.0` File Format
 
 A barspoon target file is a [TOML][1] file with the following entries:
 
@@ -8,37 +8,40 @@ A barspoon target file is a [TOML][1] file with the following entries:
     `<V>` is a [PEP-440 version string][2] compatible with `2.0`.
   - A `targets` table, the keys of which are target labels (as found in the
     clinical table) and the values specify exactly one of the following:
-     1. A categorical target label, marked by the presence of a `categories`
-        key-value pair.
-     2. A target label to quantize, marked by the presence of a `thresholds`
-        key-value pair.
-     3. A target format defined in in a later version of barspoon targets.
-    A target may only ever have one of the fields `categories` or `thresholds`.
+     1. A categorical target label, marked by the presence of a `type =
+        "category"` key-value pair.
+     2. A target label to quantize, marked by the presence of a `type =
+        "quantize"` key-value pair.
+     3. A target format defined in in a later version of barspoon targets, maked
+        by the presence of a `type = X` key-value pair, where `X` is a string
+        which is not `"category"` or `"quantize"`.
     A definition of these entries can be found below.
 
 [1]: https://toml.io "Tom's Obvious Minimal Language"
 [2]: https://peps.python.org/pep-0440/
     "PEP 440 - Version Identification and Dependency Specification"
 
-## Categorical Target Label
+## Targets
 
-A categorical target is a target table with a key-value pair `categories`.
-`categories` contains a list of lists of literal strings.  Each list of strings
-will be treated as one category, with all literal strings within that list being
-treated as one representative for that category.  This allows the user to easily
-group related classes into one large class (i.e. `"True", "1", "Yes"` could all
-be unified into the same category).
+### Categorical Target Label
 
-### Category Weights
+A categorical target is a target table with a key-value pair `type =
+"category"`.  `categories` contains a list of lists of literal strings.  Each
+list of strings will be treated as one category, with all literal strings within
+that list being treated as one representative for that category.  This allows
+the user to easily group related classes into one large class (i.e. `"True",
+"1", "Yes"` could all be unified into the same category).
+
+#### Category Weights
 
 It is possible to assign a weight to each category, to e.g. weigh rarer classes
 more heavily.  The weights are stored in a table `targets.LABEL.class_weights`,
 whose keys is the first representative of each category, and the values of which
 is the weight of the category as a floating point number.
 
-## Target Label to Quantize
+### Target Label to Quantize
 
-If a target has the `thresholds` option key set, it is interpreted as a
+If a target has key-value pair `type = "quantize"`, it is interpreted as a
 continuous target which has to be quantized.  `thresholds` has to be a list of
 floating point numbers [t_0, t_n], n > 1 containing the thresholds of the bins
 to quantize the values into.  A categorical target will be quantized into bins
@@ -61,12 +64,19 @@ for details.
   > disproportionate amount (more than n_samples/n_bins) of zeroes. We thus
   > decided to make the _right_ side of each bin inclusive, as the bin (-A,0]
   > then naturally includes those zero values.
+
+## Additional Inputs
+
+It is also possible to mark some labels as additional inputs.  These are stored
+in the `additional_inputs` table instead of the `targets` table.  Apart from
+that, additional input specifications follow the same rules as the target
+specifications described above.
 """
 import argparse
 import logging
 import sys
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, NamedTuple, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, NamedTuple, Optional, Sequence, Tuple
 
 import numpy as np
 import numpy.typing as npt
@@ -77,36 +87,29 @@ from packaging.specifiers import Specifier
 
 from barspoon.utils import read_table
 
-__all__ = ["encode_targets", "decode_targets"]
+__all__ = ["encode", "decode_targets", "Categorical"]
 
 
-class EncodedTarget(NamedTuple):
+class Categorical(NamedTuple):
     categories: List[str]
     encoded: torch.Tensor
     weight: torch.Tensor
 
 
-def encode_targets(
+def encode(
     clini_df: pd.DataFrame,
     *,
-    target_labels: Iterable[str],
     # From targets toml
-    version: str = "barspoon-targets 2.0",
-    targets: Dict[str, Any],
+    version: str = "barspoon-targets 3.0",
+    targets: Mapping[str, Any],
+    additional_inputs: Optional[Mapping[str, Any]] = None,
     **ignored,
-) -> Dict[str, EncodedTarget]:
-    """Encodes the information in a clini table into a tensor
-
-    Returns:
-        A tuple consisting of
-         1. The encoded targets
-         2. The categories' representatives #TODO elaborate
-         3. A list of the targets' classes' weights
-    """
+) -> Tuple[Dict[str, Categorical], Dict[str, Categorical]]:
+    """Encodes the information in a clini table into a tensor"""
     # Make sure target file has the right version
     name, version = version.split(" ")
     if not (
-        name == "barspoon-targets" and (spec := Specifier("~=2.0")).contains(version)
+        name == "barspoon-targets" and (spec := Specifier("~=3.0")).contains(version)
     ):
         raise ValueError(
             f"incompatible target file: expected barspoon-targets{spec}, found `{name} {version}`"
@@ -116,39 +119,53 @@ def encode_targets(
         logging.warn(f"ignored {ignored}")
 
     encoded_targets = {}
-    for target_label in target_labels:
-        info = targets[target_label]
+    for target_label, target_spec in (targets or {}).items():
+        if target_label not in clini_df:
+            logging.warning(f"no clinical data for {target_label}.  Skipping...")
+            continue
+        encoded_targets[target_label] = _encode(
+            clini_df=clini_df, label_spec=target_spec, label=target_label
+        )
 
-        if "categories" in info:
-            representatives, encoded, weight = encode_category(
-                clini_df=clini_df, target_label=target_label, **info
-            )
-            encoded_targets[target_label] = EncodedTarget(
-                categories=representatives, encoded=encoded, weight=weight
-            )
+    encoded_additionals = {}
+    for additional_label, additional_spec in (additional_inputs or {}).items():
+        if additional_label not in clini_df:
+            logging.warning(f"no clinical data for {additional_label}.  Skipping...")
+            continue
+        encoded_additionals[additional_label] = _encode(
+            clini_df=clini_df, label_spec=additional_spec, label=additional_label
+        )
 
-        elif "thresholds" in info:
-            representatives, encoded, weight = encode_quantize(
-                clini_df=clini_df, target_label=target_label, **info
-            )
-            encoded_targets[target_label] = EncodedTarget(
-                categories=representatives, encoded=encoded, weight=weight
-            )
+    return encoded_targets, encoded_additionals
 
-        else:
-            logging.warn(f"ignoring unrecognized target type {target_label}")
 
-    return encoded_targets
+def _encode(*, clini_df, label_spec, label) -> Categorical:
+    if label_spec["type"] == "category":
+        representatives, encoded, weight = encode_category(
+            clini_df=clini_df, target_label=label, **label_spec
+        )
+        return Categorical(categories=representatives, encoded=encoded, weight=weight)
+
+    elif label_spec["type"] == "quantize":
+        representatives, encoded, weight = encode_quantize(
+            clini_df=clini_df, target_label=label, **label_spec
+        )
+        return Categorical(categories=representatives, encoded=encoded, weight=weight)
+
+    else:
+        logging.warn(f"ignoring unrecognized target type {label}")
 
 
 def encode_category(
     *,
     clini_df: pd.DataFrame,
     target_label: str,
+    type: str,
     categories: Sequence[List[str]],
     class_weights: Optional[Dict[str, float]] = None,
     **ignored,
 ) -> Tuple[List[str], torch.Tensor, torch.Tensor]:
+    assert type == "category"
     # Map each category to its index
     category_map = {member: idx for idx, cat in enumerate(categories) for member in cat}
 
@@ -179,10 +196,12 @@ def encode_quantize(
     *,
     clini_df: pd.DataFrame,
     target_label: str,
+    type: str,
     thresholds: List[float],
     class_weights: Optional[Dict[str, float]] = None,
     **ignored,
 ) -> Tuple[torch.Tensor, torch.Tensor, npt.NDArray[np.str_]]:
+    assert type == "quantize"
     # Warn user of unused labels
     if ignored:
         logging.warn(f"ignored labels in target {target_label}: {ignored}")
@@ -230,12 +249,12 @@ def decode_targets(
     *,
     target_labels: Sequence[str],
     targets: Dict[str, Any],
-    version: str = "barspoon-targets 2.0",
+    version: str = "barspoon-targets 3.0",
     **ignored,
 ) -> List[np.array]:
     name, version = version.split(" ")
     if not (
-        name == "barspoon-targets" and (spec := Specifier("~=2.0")).contains(version)
+        name == "barspoon-targets" and (spec := Specifier("~=3.0")).contains(version)
     ):
         raise ValueError(f"model not compatible with barspoon-targets {spec}", version)
 
@@ -248,7 +267,8 @@ def decode_targets(
     for target_label in target_labels:
         info = targets[target_label]
 
-        if (categories := info.get("categories")) is not None:
+        if info["type"] == "category":
+            categories = info["categories"]
             # Add another column which is one iff all the other values are zero
             encoded_target = encoded[:, curr_col : curr_col + len(categories)]
             is_none = ~encoded_target.any(dim=1).view(-1, 1)
@@ -262,7 +282,8 @@ def decode_targets(
 
             curr_col += len(categories)
 
-        elif (thresholds := info.get("thresholds")) is not None:
+        elif info["type"] == "quantize":
+            thresholds = info["thresholds"]
             n_bins = len(thresholds) - 1
             encoded_target = encoded[:, curr_col : curr_col + n_bins]
             is_none = ~encoded_target.any(dim=1).view(-1, 1)
@@ -282,7 +303,7 @@ def decode_targets(
             curr_col += n_bins
 
         else:
-            raise ValueError(f"cannot decode {target_label}: no target info")
+            raise ValueError(f"cannot decode {target_label} of type {info['type']}")
 
     return decoded_targets
 
@@ -342,7 +363,7 @@ def main():
     clini_df = pd.concat([read_table(c) for c in args.clini_tables])
 
     # Artifact name and version
-    outtoml.write('version = "barspoon-targets 2.0"\n\n')
+    outtoml.write('version = "barspoon-targets 3.0"\n\n')
 
     # Translation table to escape basic strings in TOML
     escape_table = str.maketrans(
@@ -367,6 +388,7 @@ def main():
         prefix = "#" if (counts >= args.category_min_count).sum() <= 1 else ""
 
         outtoml.write(f'{prefix}[targets."{target_label.translate(escape_table)}"]\n')
+        outtoml.write(f'{prefix}type = "category"\n')
 
         # List all categories with little-populated categories being commented
         # out
@@ -432,6 +454,7 @@ def main():
         prefix = "#" if len(categories) < 2 else ""
 
         outtoml.write(f'{prefix}[targets."{target_label.translate(escape_table)}"]\n')
+        outtoml.write(f'{prefix}type = "quantize"\n')
 
         draw_histogram(vals=vals, outtoml=outtoml, prefix=prefix)
 
