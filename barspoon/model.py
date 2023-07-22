@@ -1,7 +1,7 @@
 # %%
+import re
 from typing import Any, Dict, Mapping, Tuple
 
-import re
 import pytorch_lightning as pl
 import torch
 import torch.nn.functional as F
@@ -102,6 +102,7 @@ class EncDecTransformer(nn.Module):
         num_encoder_layers: int = 2,
         num_decoder_layers: int = 2,
         dim_feedforward: int = 2048,
+        positional_encoding: bool = True,
     ) -> None:
         super().__init__()
 
@@ -122,7 +123,10 @@ class EncDecTransformer(nn.Module):
 
         # One class token per output label
         self.class_tokens = nn.ParameterDict(
-            {sanitize(target_label): torch.rand(d_model) for target_label in target_n_outs}
+            {
+                sanitize(target_label): torch.rand(d_model)
+                for target_label in target_n_outs
+            }
         )
 
         decoder_layer = nn.TransformerDecoderLayer(
@@ -138,10 +142,14 @@ class EncDecTransformer(nn.Module):
 
         self.heads = nn.ModuleDict(
             {
-                sanitize(target_label): nn.Linear(in_features=d_model, out_features=n_out)
+                sanitize(target_label): nn.Linear(
+                    in_features=d_model, out_features=n_out
+                )
                 for target_label, n_out in target_n_outs.items()
             }
         )
+
+        self.positional_encoding = positional_encoding
 
     def forward(
         self,
@@ -152,19 +160,20 @@ class EncDecTransformer(nn.Module):
 
         tile_tokens = self.projector(tile_tokens)  # shape: [bs, seq_len, d_model]
 
-        # Add positional encodings
-        d_model = tile_tokens.size(-1)
-        x = tile_positions.unsqueeze(-1) / 100_000 ** (
-            torch.arange(d_model // 4).type_as(tile_positions) / d_model
-        )
-        positional_encodings = torch.cat(
-            [
-                torch.sin(x).flatten(start_dim=-2),
-                torch.cos(x).flatten(start_dim=-2),
-            ],
-            dim=-1,
-        )
-        tile_tokens = tile_tokens + positional_encodings
+        if self.positional_encoding:
+            # Add positional encodings
+            d_model = tile_tokens.size(-1)
+            x = tile_positions.unsqueeze(-1) / 100_000 ** (
+                torch.arange(d_model // 4).type_as(tile_positions) / d_model
+            )
+            positional_encodings = torch.cat(
+                [
+                    torch.sin(x).flatten(start_dim=-2),
+                    torch.cos(x).flatten(start_dim=-2),
+                ],
+                dim=-1,
+            )
+            tile_tokens = tile_tokens + positional_encodings
 
         tile_tokens = self.transformer_encoder(tile_tokens)
 
@@ -321,6 +330,7 @@ class LitEncDecTransformer(LitMilClassificationMixin):
         num_encoder_layers: int = 2,
         num_decoder_layers: int = 2,
         dim_feedforward: int = 2048,
+        positional_encoding: bool = True,
         # Other hparams
         learning_rate: float = 1e-4,
         **hparams: Any,
@@ -340,6 +350,7 @@ class LitEncDecTransformer(LitMilClassificationMixin):
             num_encoder_layers=num_encoder_layers,
             num_decoder_layers=num_decoder_layers,
             dim_feedforward=dim_feedforward,
+            positional_encoding=positional_encoding,
         )
 
         self.save_hyperparameters()

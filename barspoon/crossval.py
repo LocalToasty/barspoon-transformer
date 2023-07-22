@@ -1,12 +1,12 @@
 import argparse
 import os
-import tomli
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Sequence, Tuple
 
 import numpy as np
 import numpy.typing as npt
 import pytorch_lightning as pl
+import tomli
 import torch
 from pytorch_lightning.callbacks import EarlyStopping, ModelCheckpoint
 from pytorch_lightning.loggers import CSVLogger
@@ -87,7 +87,7 @@ def main():
             target_labels=target_labels,
             weights={k: v.weight for k, v in train_encoded_targets.items()},
             # Other hparams
-            version="barspoon-transformer 3.0",
+            version="barspoon-transformer 3.1",
             categories={k: v.categories for k, v in train_encoded_targets.items()},
             target_file=target_info,
             **{
@@ -228,6 +228,9 @@ def make_argument_parser() -> argparse.ArgumentParser:
     model_parser.add_argument("--num-decoder-layers", type=int, default=2)
     model_parser.add_argument("--d-model", type=int, default=512)
     model_parser.add_argument("--dim-feedforward", type=int, default=2048)
+    model_parser.add_argument(
+        "--no-positional-encoding", dest="positional_encoding", action="store_false"
+    )
 
     training_parser = parser.add_argument_group("training options")
     training_parser.add_argument("--instances-per-bag", type=int, default=2**12)
