@@ -275,10 +275,7 @@ class LearnedNorm(nn.Module):
             self.mean = (mean_a + delta * n_b / self.n).detach()
             self.m2 = (m2_a + m2_b + delta**2 * n_a * n_b / self.n).detach()
 
-        if self.n < 2:
-            return x
-        else:
-            return (x - self.mean) / self.std
+        return (x - self.mean) / self.std.where(self.m2 != 0, 1)
 
     @property
     def std(self) -> torch.Tensor:
