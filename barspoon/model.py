@@ -119,7 +119,11 @@ class EncDecTransformer(nn.Module):
     ) -> None:
         super().__init__()
 
-        self.projector = nn.Sequential(nn.Linear(d_features, d_model), nn.ReLU())
+        self.projector = nn.Sequential(
+            LearnedNorm(d_features, ignore_zeros=True),
+            nn.Linear(d_features, d_model),
+            nn.ReLU(),
+        )
 
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=d_model,
@@ -236,6 +240,50 @@ class EncDecTransformer(nn.Module):
         }
 
         return logits
+
+
+class LearnedNorm(nn.Module):
+    """Adaptively learns inputs' stats and transforms the inputs into z-scores
+
+    https://en.wikipedia.org/wiki/Algorithms_for_calculating_variance#Parallel_algorithm
+    """
+
+    def __init__(self, d_feats, ignore_zeros=False):
+        super().__init__()
+        self.register_buffer("n", torch.zeros(1))
+        self.register_buffer("mean", torch.zeros(d_feats))
+        self.register_buffer("m2", torch.zeros(d_feats))
+        self.ignore_zeros = ignore_zeros
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.training:
+            n_a, mean_a, m2_a = self.n, self.mean, self.m2
+
+            x_flat = torch.flatten(x, end_dim=-2) if x.ndim > 1 else x
+            if self.ignore_zeros:
+                # For tile embeddings we pad slides with too few tiles with
+                # all zero feature vectors.  These would mess up our running
+                # stats, so we filter them out.
+                x_flat = x_flat[(x_flat != 0).any(-1)]
+
+            n_b = x_flat.shape[0]
+            mean_b = x_flat.mean(dim=0)
+            m2_b = x_flat.var(dim=0) * n_b
+
+            self.n = (n_a + n_b).detach()
+            delta = mean_b - mean_a
+            self.mean = (mean_a + delta * n_b / self.n).detach()
+            self.m2 = (m2_a + m2_b + delta**2 * n_a * n_b / self.n).detach()
+
+        if self.n < 2:
+            return x
+        else:
+            return (x - self.mean) / self.std
+
+    @property
+    def std(self) -> torch.Tensor:
+        var = self.m2 / (self.n - 1)
+        return torch.sqrt(var)
 
 
 class LitMilClassificationMixin(pl.LightningModule):
@@ -419,6 +467,7 @@ class LitEncDecTransformer(LitMilClassificationMixin):
             positional_encoding=positional_encoding,
             additional_encoders={
                 label: nn.Sequential(
+                    LearnedNorm(n_feats, ignore_zeros=True),
                     nn.Linear(
                         in_features=n_feats, out_features=(n_feats + d_model) // 2
                     ),
