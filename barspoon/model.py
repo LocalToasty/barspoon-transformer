@@ -464,7 +464,6 @@ class LitEncDecTransformer(LitMilClassificationMixin):
             positional_encoding=positional_encoding,
             additional_encoders={
                 label: nn.Sequential(
-                    LearnedNorm(n_feats, ignore_zeros=True),
                     nn.Linear(
                         in_features=n_feats, out_features=(n_feats + d_model) // 2
                     ),
