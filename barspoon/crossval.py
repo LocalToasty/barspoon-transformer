@@ -29,7 +29,7 @@ def main():
     with open(args.target_file, "rb") as target_toml_file:
         target_info = tomli.load(target_toml_file)
     target_labels = list(target_info["targets"].keys())
-    additional_labels = list(target_info["additional_inputs"].keys())
+    additional_labels = list(target_info.get("additional_inputs", {}).keys())
 
     dataset_df = make_dataset_df(
         clini_tables=args.clini_tables,
