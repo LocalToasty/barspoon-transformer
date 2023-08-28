@@ -42,11 +42,12 @@ We output two kinds of heatmaps:
 
 import argparse
 import logging
+import os
+import warnings
 from collections import defaultdict
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
-import h5py
 import matplotlib.pyplot as plt
 import numpy as np
 import numpy.typing as npt
@@ -59,6 +60,7 @@ from tqdm import tqdm
 
 from barspoon.data import BagDataset
 from barspoon.model import LitEncDecTransformer
+from barspoon.target_file import encode
 from barspoon.utils import make_dataset_df
 
 
@@ -92,10 +94,10 @@ def main():
         patient_col=args.patient_col,
         filename_col=args.filename_col,
         group_by=args.filename_col,
-        labels_to_keep=model.hparams["additional_inputs"].keys(),
+        labels_to_keep=additional_labels,
     )
 
-    valid_additional_inputs = encode(dataset_df, **target_info)
+    _, additional_inputs = encode(dataset_df, **model.hparams["target_file"])
 
     # Make a dataset with faux labels (the labels will be ignored)
     ds = BagDataset(
@@ -106,62 +108,74 @@ def main():
     )
     dl = DataLoader(ds, shuffle=False, num_workers=args.num_workers)
 
-    for slides, batch in tqdm(dataset_df.path, dl):
-        breakpoint()
-        assert (
-            len(slides) == 1
-        ), "there should only be one slide per item after grouping by slidename"
-        h5_path = slides[0]
+    # Flatten all lists of slide paths, as there should only be one slide anyhow
+    assert (
+        dataset_df.path.map(len) == 1
+    ).all(), "there should only be one slide per item after grouping by slidename"
+    dataset_df.path = dataset_df.path.map(lambda slides: slides[0])
 
-        # Load features
-        with h5py.File(h5_path) as h5_file:
-            feats = torch.tensor(
-                h5_file["feats"][:], dtype=torch.bfloat16, device=args.device
-            )
-            coords = torch.tensor(h5_file["coords"][:])
-            xs = np.sort(np.unique(coords[:, 0]))
-            stride = np.min(xs[1:] - xs[:-1])
+    all_gradcams, all_score_maps, all_masks = {}, {}, {}
+    for h5_path, batch in tqdm(zip(dataset_df.path[:3], dl), total=len(dataset_df)):
+        bags, coords, _, additional = batch
+        feats = bags.squeeze(0).to(device=args.device, dtype=torch.bfloat16)
+        coords = coords.squeeze(0).long()
+
+        xs = np.sort(np.unique(coords[:, 0]))
+        stride = int(np.min(xs[1:] - xs[:-1]))
 
         categories = model.hparams["categories"]
 
         # Generate the gradcams
         # Skip the slide if we are out of memory
         try:
-            gradcams = compute_gradcams(
+            gradcams, score_maps = compute_score_maps(
                 model=model,
                 feats=feats,
                 coords=coords,
+                additional=additional,
                 stride=stride,
                 categories=categories,
                 batch_size=args.batch_size,
             )
+            # We store all maps in the first pass, so we can do some statistics on them later
+            all_gradcams[h5_path] = gradcams
+            all_score_maps[h5_path] = score_maps
+            # The mask is 1 wherever we have a feature
+            all_masks[h5_path] = vals_to_im(
+                np.ones((len(coords), 1)), coords.numpy(), stride
+            )[0]
+
         except torch.cuda.OutOfMemoryError as oom_error:  # type: ignore
-            logging.error(f"error while processing {slides[0]}: {oom_error})")
+            logging.error(f"error while processing {h5_path}: {oom_error})")
             continue
 
-        # The mask is 1 wherever we have a feature
-        mask = vals_to_im(np.ones((len(coords), 1)), coords.numpy(), stride)[0]
-        # The gradcam entry with the overall highest magnitude in the slide.
-        # Used for scaling.
-        slide_abs_max = abs(
-            # We first have to re-flatten all the gradcam heatmaps
-            # TODO maybe it's easier to just pass the gradcam images around in
-            # their stacked form?
-            np.stack(
-                [
-                    list(g)
-                    for categories in gradcams.values()
-                    for g in categories.values()
-                ]
-            )
-        ).max()
+    gradcam_abs_maxs = {
+        target_label: max(
+            [
+                abs(cat).max()
+                for gc in all_gradcams.values()
+                for cat in gc[target_label].values()
+            ]
+        )
+        for target_label in gradcams
+    }
+
+    for h5_path, batch in tqdm(zip(dataset_df.path, dl), total=len(dataset_df)):
+        gradcams = all_gradcams[h5_path]
+        score_maps = all_score_maps[h5_path]
+        mask = all_masks[h5_path]
 
         # Save all the heatmaps
         (outdir := args.output_dir / h5_path.stem).mkdir(exist_ok=True, parents=True)
-        for target_label, categories in gradcams.items():
+        for target_label, target_gradcams in gradcams.items():
             gradcam_im = plt.get_cmap("magma")(
-                abs(np.stack(categories.values())).mean(0) / slide_abs_max
+                raw := (
+                    abs(np.stack(list(target_gradcams.values()))).mean(0)
+                    / gradcam_abs_maxs[target_label]
+                )
             )
+            assert raw.min() >= 0 and raw.max() <= 1
+
             gradcam_im[:, :, -1] = mask
             Image.fromarray(
                 np.uint8(255 * gradcam_im),
@@ -171,7 +185,7 @@ def main():
                 np.array(mask.shape)[::-1] * 8,
                 resample=Image.Resampling.NEAREST,
             ).save(
-                outdir / f"gradcam_absolute_{target_label}.png",
+                outdir / f"{target_label}_gradcam_absolute.png",
                 pnginfo=make_metadata(
                     # Metadata format semver
                     # Update minor version when adding fields,
@@ -180,51 +194,50 @@ def main():
                     filename=h5_path.stem,
                     stride=str(stride / 8),
                     target_label=target_label,
-                    scale=f"{slide_abs_max}",
+                    scale=f"{gradcam_abs_maxs[target_label]}",
                 ),
             )
 
-            for category, cat_gradcam in categories.items():
-                # for category, cat_gradcam in zip(cs, gradcams[left:right], strict=True):
-                # Both the class-indicating map and the alpha map contain
-                # information on the "importance" of a region, where the
-                # class-indicating map becomes more faint for low attention
-                # regions and the alpha becomes more transparent.  Since those
-                # two factors of faintness would otherwise multiplicatively
-                # compound we take the square root of both, counteracting the
-                # effect.
-                gradcam_im = plt.get_cmap("coolwarm")(
-                    np.sign(cat_gradcam)
-                    * np.sqrt(abs(cat_gradcam) / abs(cat_gradcam).max())
-                    / 2
-                    + 0.5
+            target_score_maps = score_maps[target_label]
+            for category, cat_score_map in target_score_maps.items():
+                # TODO At the moment we assume the "cutoff" for the `coolwarm`
+                # cmap to be at 0.5.  This assumption _breaks down_ if our
+                # problem isn't binary.  We should probably use another
+                # non-diverging cmap in that case...
+
+                if len(target_score_maps) != 2:
+                    warnings.warn(
+                        "heatmaps will probably be misguiding for targets with more than two classes"
+                    )
+
+                score_map_im = plt.get_cmap("coolwarm")(
+                    cat_score_map / abs(cat_score_map).max() / 2 + 0.5
                 )
-                gradcam_im[:, :, -1] = np.sqrt(
-                    abs(cat_gradcam) / abs(cat_gradcam).max()
-                )
+                score_map_im[:, :, -1] = mask
                 Image.fromarray(
-                    np.uint8(255 * gradcam_im),
+                    np.uint8(255 * score_map_im),
                     "RGBA",
                 ).resize(
                     np.array(mask.shape)[::-1] * 8, resample=Image.Resampling.NEAREST
                 ).save(
-                    outdir / f"gradcam_{target_label}_{category}.png",
+                    outdir / f"{target_label}_{category}_score_map.png",
                     pnginfo=make_metadata(
-                        version="barspoon-cat-gradcam 1.0",
+                        version="barspoon-cat-score_map 1.0",
                         filename=h5_path.stem,
                         stride=str(stride / 8),
                         target_label=target_label,
                         category=category,
-                        scale=f"{abs(cat_gradcam).max():e}",
+                        scale=f"{abs(cat_score_map).max():e}",
                     ),
                 )
 
 
-def compute_gradcams(
+def compute_score_maps(
     *,
     model: LitEncDecTransformer,
     feats: torch.Tensor,
     coords: torch.Tensor,
+    additional: torch.Tensor,
     stride: int,
     categories: Mapping[str, Sequence[str]],
     batch_size: int,
@@ -254,9 +267,11 @@ def compute_gradcams(
         feats_t = feats_t.detach()  # Zero grads of input features
         feats_t.requires_grad = True
         model.zero_grad()
-        scores = model.predict_step((feats_t, coords.type_as(feats_t)), batch_idx=0)
+        scores = model.predict_step(
+            (feats_t, coords.type_as(feats_t), None, additional), batch_idx=0
+        )
 
-        # TODO update this comment; the sentiment is all true
+        # TODO update this comment; the idea is still the same
         # Now we have a stack of predictions for each class.  All the rows
         # should be exactly the same, as they only depend on the (repeated and
         # thus identical) tile features.  If we now take the diagonal values
@@ -283,12 +298,51 @@ def compute_gradcams(
         stride,
     )
 
+    # Compute tile scores by pretending each tile is its own slide
+    tile_scores = model.predict_step(
+        (
+            feats.unsqueeze(1),
+            # We replace the coordinates with zeros; otherwise we get artifacts
+            # along lines where the positional embeddings are large in
+            # magnitude.
+            # These artifacts only appear if a slide is comprised of very few
+            # tiles, presumably because for slides with many tiles the
+            # self-attention takes care of these outliers.
+            torch.zeros_like(coords.type_as(feats).unsqueeze(1)),
+            None,
+            additional,
+        ),
+        batch_idx=0,
+    )
+    tile_scores_2d = vals_to_im(
+        torch.stack(
+            [
+                tile_scores[target][:, idx] - 0.5
+                for target, idx, _ in flattened_categories
+            ]
+        )
+        .float()
+        .cpu()
+        .detach()
+        .permute(1, 0)
+        .numpy(),
+        coords.to(torch.int).cpu().numpy(),
+        stride,
+    ) * abs(gradcams_2d)
+
     unflattened_gradcams_2d = defaultdict(dict)
     for (target_label, _, category), gradcam_2d in zip(
         flattened_categories, gradcams_2d
     ):
         unflattened_gradcams_2d[target_label][category] = gradcam_2d
-    return unflattened_gradcams_2d
+
+    unflattened_tile_scores_2d = defaultdict(dict)
+    for (target_label, _, category), tile_scores_2d in zip(
+        flattened_categories, tile_scores_2d
+    ):
+        unflattened_tile_scores_2d[target_label][category] = tile_scores_2d
+
+    return unflattened_gradcams_2d, unflattened_tile_scores_2d
 
 
 def vals_to_im(
@@ -381,10 +435,9 @@ def make_argument_parser() -> argparse.ArgumentParser:
 
     parser.add_argument("--batch-size", type=int, default=0x20)
 
+    parser.add_argument("--num-workers", type=int, default=min(os.cpu_count() or 0, 8))
     parser.add_argument(
-        "--device",
-        type=str,
-        default="cuda:0" if torch.cuda.is_available() else "cpu",
+        "--device", type=str, default="cuda:0" if torch.cuda.is_available() else "cpu"
     )
 
     return parser
