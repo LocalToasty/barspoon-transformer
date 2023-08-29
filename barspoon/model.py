@@ -38,7 +38,7 @@ class EncDecTransformer(nn.Module):
         t1 ->|FC|--+-->|   |--+     // Encoded tile tokens
          .   +--+      | E |  |
          .             | x |  |
-         .   +--+      | n |  |
+         .   +--+      | m |  |
         tn ->|FC|--+-->|   |--+
              +--+  ^   +---+  |
                    |          |
@@ -56,7 +56,7 @@ class EncDecTransformer(nn.Module):
         c1 ---------------->|   |-->|FC1|--> s1
          .                  | D |   +---+     .
          .                  | x |             .
-         .                  | k |   +---+     .
+         .                  | l |   +---+     .
         ck ---------------->|   |-->|FCk|--> sk
                             +---+   +---+
 
