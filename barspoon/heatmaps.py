@@ -115,7 +115,7 @@ def main():
     dataset_df.path = dataset_df.path.map(lambda slides: slides[0])
 
     all_gradcams, all_score_maps, all_masks = {}, {}, {}
-    for h5_path, batch in tqdm(zip(dataset_df.path[:3], dl), total=len(dataset_df)):
+    for h5_path, batch in tqdm(zip(dataset_df.path, dl), total=len(dataset_df)):
         bags, coords, _, additional = batch
         feats = bags.squeeze(0).to(device=args.device, dtype=torch.bfloat16)
         coords = coords.squeeze(0).long()
