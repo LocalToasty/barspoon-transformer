@@ -1,6 +1,6 @@
 # %%
 import re
-from typing import Any, Dict, Mapping, Tuple
+from typing import Any, Dict, Mapping, Tuple, TypeAlias
 
 import pytorch_lightning as pl
 import torch
@@ -15,6 +15,9 @@ __all__ = [
     "LitMilClassificationMixin",
     "SafeMulticlassAUROC",
 ]
+
+
+TargetLabel: TypeAlias = str
 
 
 class EncDecTransformer(nn.Module):
@@ -201,7 +204,7 @@ class LitMilClassificationMixin(pl.LightningModule):
     def __init__(
         self,
         *,
-        weights: Dict[str, torch.Tensor],
+        weights: Dict[TargetLabel, torch.Tensor],
         # Other hparams
         learning_rate: float = 1e-4,
         **hparams: Any,
@@ -286,6 +289,7 @@ class LitMilClassificationMixin(pl.LightningModule):
             feats, positions = batch
         else:
             feats, positions, _ = batch
+
         logits = self(feats, positions)
 
         softmaxed = {
@@ -322,7 +326,7 @@ class LitEncDecTransformer(LitMilClassificationMixin):
         self,
         *,
         d_features: int,
-        weights: Mapping[str, torch.Tensor],
+        weights: Mapping[TargetLabel, torch.Tensor] = None,
         # Model parameters
         d_model: int = 512,
         num_encoder_heads: int = 8,

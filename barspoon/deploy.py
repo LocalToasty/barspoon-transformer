@@ -62,7 +62,7 @@ def main():
     )
     predictions = flatten_batched_dicts(trainer.predict(model=model, dataloaders=dl))
     preds_df = make_preds_df(
-        predictions=predictions,
+        predictions={k: v.float() for k, v in predictions.items()},
         base_df=dataset_df.drop(columns="path"),
         categories=model.hparams["categories"],
     )

@@ -42,22 +42,26 @@ We output two kinds of heatmaps:
 
 import argparse
 import logging
+import re
 from collections import defaultdict
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Mapping, Sequence
 
 import h5py
 import matplotlib.pyplot as plt
 import numpy as np
-import numpy.typing as npt
 import torch
+from jaxtyping import Float, Int
 from packaging.specifiers import SpecifierSet
 from PIL import Image
 from PIL.PngImagePlugin import PngInfo
+from torch import Tensor
 from tqdm import tqdm
 
-from barspoon.model import LitEncDecTransformer
+from barspoon.model import LitEncDecTransformer, TargetLabel
 from barspoon.utils import make_dataset_df
+
+CategoryLabel = str
 
 
 def main():
@@ -96,10 +100,10 @@ def main():
 
         # Load features
         with h5py.File(h5_path) as h5_file:
-            feats = torch.tensor(
+            feats: Float[Tensor, "n_tiles d_feats"] = torch.tensor(
                 h5_file["feats"][:], dtype=torch.bfloat16, device=args.device
             )
-            coords = torch.tensor(h5_file["coords"][:])
+            coords: Int[Tensor, "n_tiles 2"] = torch.tensor(h5_file["coords"][:])
             xs = np.sort(np.unique(coords[:, 0]))
             stride = np.min(xs[1:] - xs[:-1])
 
@@ -108,113 +112,116 @@ def main():
         # Generate the gradcams
         # Skip the slide if we are out of memory
         try:
-            gradcams = compute_gradcams(
+            with torch.inference_mode():
+                overall_scores = model.predict_step(
+                    (
+                        feats.unsqueeze(0),
+                        coords.type_as(feats).unsqueeze(0),
+                    ),
+                    batch_idx=0,
+                )
+                scores: Mapping[TargetLabel, Float[Tensor, "n_tiles cat_classes"]] = {}
+                for i in range(0, feats.shape[0], args.batch_size):
+                    scores = recursive_union(
+                        scores,
+                        model.predict_step(
+                            (
+                                feats[i : i + args.batch_size].unsqueeze(-2),
+                                # coords.type_as(feats),
+                                torch.zeros_like(coords).type_as(feats),
+                            ),
+                            batch_idx=0,
+                        ),
+                    )
+            scores: Mapping[
+                TargetLabel, Mapping[CategoryLabel, Float[Tensor, "n_tiles"]]
+            ] = {
+                target_label: {
+                    category_label: scores[target_label][:, category_index].cpu()
+                    for category_index, category_label in enumerate(category_labels)
+                }
+                for target_label, category_labels in categories.items()
+            }
+
+            gradcams: Mapping[
+                TargetLabel, Mapping[CategoryLabel, Float[Tensor, "n_tiles"]]
+            ] = compute_gradcams(
                 model=model,
                 feats=feats,
                 coords=coords,
-                stride=stride,
                 categories=categories,
                 batch_size=args.batch_size,
+                device="cpu",
             )
         except torch.cuda.OutOfMemoryError as oom_error:  # type: ignore
             logging.error(f"error while processing {slides[0]}: {oom_error})")
             continue
 
-        # The mask is 1 wherever we have a feature
-        mask = vals_to_im(np.ones((len(coords), 1)), coords.numpy(), stride)[0]
-        # The gradcam entry with the overall highest magnitude in the slide.
-        # Used for scaling.
-        slide_abs_max = abs(
-            # We first have to re-flatten all the gradcam heatmaps
-            # TODO maybe it's easier to just pass the gradcam images around in
-            # their stacked form?
-            np.stack(
-                [
-                    list(g)
-                    for categories in gradcams.values()
-                    for g in categories.values()
-                ]
-            )
-        ).max()
-
-        # Save all the heatmaps
-        (outdir := args.output_dir / h5_path.stem).mkdir(exist_ok=True, parents=True)
-        for target_label, categories in gradcams.items():
-            gradcam_im = plt.get_cmap("magma")(
-                abs(np.stack(categories.values())).mean(0) / slide_abs_max
-            )
-            gradcam_im[:, :, -1] = mask
-            Image.fromarray(
-                np.uint8(255 * gradcam_im),
-                "RGBA",
-            ).resize(
-                # Save the image x8 because that tends to be easier to work with
-                np.array(mask.shape)[::-1] * 8,
-                resample=Image.Resampling.NEAREST,
-            ).save(
-                outdir / f"gradcam_absolute_{target_label}.png",
-                pnginfo=make_metadata(
-                    # Metadata format semver
-                    # Update minor version when adding fields,
-                    # Major when removing fields / changing semantics
-                    version="barspoon-absolute-gradcam 1.0",
-                    filename=h5_path.stem,
-                    stride=str(stride / 8),
-                    target_label=target_label,
-                    scale=f"{slide_abs_max}",
-                ),
-            )
-
-            for category, cat_gradcam in categories.items():
-                # for category, cat_gradcam in zip(cs, gradcams[left:right], strict=True):
-                # Both the class-indicating map and the alpha map contain
-                # information on the "importance" of a region, where the
-                # class-indicating map becomes more faint for low attention
-                # regions and the alpha becomes more transparent.  Since those
-                # two factors of faintness would otherwise multiplicatively
-                # compound we take the square root of both, counteracting the
-                # effect.
-                gradcam_im = plt.get_cmap("coolwarm")(
-                    np.sign(cat_gradcam)
-                    * np.sqrt(abs(cat_gradcam) / abs(cat_gradcam).max())
-                    / 2
-                    + 0.5
+        for target_label, category_labels in categories.items():
+            topk = torch.stack(list(scores[target_label].values())).topk(2, dim=-2)
+            score_stack = torch.stack(list(scores[target_label].values()))
+            for cat_idx, pos_category_label in enumerate(category_labels):
+                category_support = torch.where(
+                    topk.indices[0] == cat_idx,
+                    score_stack[cat_idx] - topk.values[1],
+                    score_stack[cat_idx] - topk.values[0],
                 )
-                gradcam_im[:, :, -1] = np.sqrt(
-                    abs(cat_gradcam) / abs(cat_gradcam).max()
+                attention = torch.where(
+                    topk.indices[0] == cat_idx,
+                    (gradcam := gradcams[target_label][pos_category_label].abs())
+                    / gradcam.max(),
+                    (
+                        gradcam := torch.stack(
+                            [
+                                gradcams[target_label][category_label].abs()
+                                for category_label in category_labels
+                                if category_label != pos_category_label
+                            ]
+                        )
+                        .max(dim=0)
+                        .values
+                    )
+                    / gradcam.max(),
                 )
-                Image.fromarray(
-                    np.uint8(255 * gradcam_im),
-                    "RGBA",
-                ).resize(
-                    np.array(mask.shape)[::-1] * 8, resample=Image.Resampling.NEAREST
+
+                category_support_2d = (
+                    vals_to_im(category_support, coords // stride)
+                    .detach()
+                    .cpu()
+                    .float()
+                )
+                attention_2d = (
+                    vals_to_im(attention, coords // stride).detach().cpu().float()
+                )
+
+                score_im = plt.get_cmap("RdBu")(
+                    -category_support_2d * attention_2d / 2 + 0.5
+                )
+                score_im[..., -1] = attention_2d > 0
+
+                target_dir = Path(args.output_dir) / str(target_label)
+                target_dir.mkdir(exist_ok=True, parents=True)
+                sanitized_pos_cat_label = re.sub(
+                    r"[^()\-.0-9;A-Z\[\]^_a-z]", "_", pos_category_label
+                )
+                Image.fromarray(np.uint8(score_im * 255)).resize(
+                    np.array(score_im.shape[:2][::-1]) * 8, resample=Image.NEAREST
                 ).save(
-                    outdir / f"gradcam_{target_label}_{category}.png",
-                    pnginfo=make_metadata(
-                        version="barspoon-cat-gradcam 1.0",
-                        filename=h5_path.stem,
-                        stride=str(stride / 8),
-                        target_label=target_label,
-                        category=category,
-                        scale=f"{abs(cat_gradcam).max():e}",
-                    ),
+                    target_dir
+                    / f"scores-{h5_path.stem}-{target_label}-{sanitized_pos_cat_label}={overall_scores[target_label][0,cat_idx]:1.2f}.png"
                 )
 
 
 def compute_gradcams(
     *,
     model: LitEncDecTransformer,
-    feats: torch.Tensor,
-    coords: torch.Tensor,
-    stride: int,
-    categories: Mapping[str, Sequence[str]],
+    feats: Float[Tensor, "n_tiles d_feats"],
+    coords: Int[Tensor, "n_tiles 2"],
+    categories: Mapping[TargetLabel, Sequence[CategoryLabel]],
     batch_size: int,
-) -> npt.NDArray[np.float_]:
-    """Computes a stack of attention maps
-
-    Returns:
-        An array of shape [n_dim, x, y]
-    """
+    device=None,
+) -> Mapping[TargetLabel, Mapping[CategoryLabel, Float[Tensor, "n_tiles"]]]:
+    """Computes a stack of attention maps"""
     n_outputs = sum(len(c) for c in categories.values())
     flattened_categories = [
         (target, cat_idx, category)
@@ -227,15 +234,18 @@ def compute_gradcams(
     # Since this would be infeasible for models with many targets, we don't
     # calculate all gradcams at once, but do it in batches instead.
     gradcams = []
-    feats_t = feats.unsqueeze(0).repeat(min(batch_size, n_outputs), 1, 1)
-    # `feats_t` now has the shape [n_outs, n_tiles, n_features]
-    # or [batch_size, n_tiles, n_features], whichever is smaller
+    batch_size = min(batch_size, n_outputs)
+    feats_batch: Float[Tensor, "batch_size n_tiles d_feats"] = feats.unsqueeze(
+        0
+    ).repeat(batch_size, 1, 1)
     model = model.eval()
     for idx in range(0, n_outputs, batch_size):
-        feats_t = feats_t.detach()  # Zero grads of input features
-        feats_t.requires_grad = True
+        feats_batch = feats_batch.detach()  # Zero grads of input features
+        feats_batch.requires_grad = True
         model.zero_grad()
-        scores = model.predict_step((feats_t, coords.type_as(feats_t)), batch_idx=0)
+        scores = model.predict_step(
+            (feats_batch, coords.type_as(feats_batch)), batch_idx=0
+        )
 
         # TODO update this comment; the sentiment is all true
         # Now we have a stack of predictions for each class.  All the rows
@@ -252,41 +262,50 @@ def compute_gradcams(
             )
         ).backward()
 
-        gradcam = (feats_t.grad * feats_t).sum(-1)
-        gradcams.append(gradcam.detach().cpu())
+        gradcam: Float[Tensor, "batch_size n_tiles"] = (
+            feats_batch.grad * feats_batch
+        ).sum(-1)
+        gradcams.append(gradcam.detach().to(device=device))
 
     # If n_outs isn't divisible by batch_size, we'll have some superfluous
     # output maps which we have to drop
-    gradcams = torch.cat(gradcams)[:n_outputs]
-    gradcams_2d = vals_to_im(
-        gradcams.permute(1, 0).float().numpy(),
-        coords.to(torch.int).cpu().numpy(),
-        stride,
-    )
-
+    gradcams: Float[Tensor, "n_outputs n_tiles"] = torch.cat(gradcams)[:n_outputs]
     unflattened_gradcams_2d = defaultdict(dict)
-    for (target_label, _, category), gradcam_2d in zip(
-        flattened_categories, gradcams_2d
-    ):
+    for (target_label, _, category), gradcam_2d in zip(flattened_categories, gradcams):
         unflattened_gradcams_2d[target_label][category] = gradcam_2d
+
     return unflattened_gradcams_2d
 
 
 def vals_to_im(
-    scores: npt.NDArray[Any], coords: npt.NDArray[np.int_], stride: int
-) -> npt.NDArray[np.float_]:
-    """Converts linear arrays of scores, coords into a 2d array
+    scores: Float[Tensor, "n_tiles *d_feats"],
+    norm_coords: Int[Tensor, "n_tiles *d_feats"],
+) -> Float[Tensor, "i j *d_feats"]:
+    """Arranges scores in a 2d grid according to coordinates"""
+    size = norm_coords.max(0).values.flip(0) + 1
+    im = torch.zeros((*size, *scores.shape[1:])).type_as(scores)
 
-    Args:
-        scores: An array of scores [n_tiles, ...]
-        coords: An array of coordinates [n_tiles, ...], relating each tile to a
-            position
-    """
-    size = coords.max(0)[::-1] // stride + 1
-    im = np.zeros((scores.shape[-1], *size))
-    for s, c in zip(scores, coords, strict=True):
-        im[:, c[1] // stride, c[0] // stride] = s
+    flattened_im = im.flatten(end_dim=1)
+    flattened_coords = norm_coords[:, 1] * im.shape[1] + norm_coords[:, 0]
+    flattened_im[flattened_coords] = scores
+
+    im = flattened_im.reshape_as(im)
+
     return im
+
+
+def recursive_union(*dicts):
+    res = {}
+    for d in dicts:
+        for k, v in d.items():
+            if isinstance(v, dict):
+                res[k] = recursive_union(res[k], v) if k in res else v
+            elif isinstance(v, Tensor):
+                res[k] = torch.cat((res[k], v)) if k in res else v
+            else:
+                raise RuntimeError()
+
+    return res
 
 
 def make_metadata(**kwargs) -> PngInfo:
