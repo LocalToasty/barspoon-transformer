@@ -71,6 +71,8 @@ def main():
     # Load model and ensure its version is compatible
     # We do all computations in bfloat16, as it needs way less VRAM and performs
     # virtually identical to float32 in inference tasks.
+    # If no GPU support for bfloat16 is available, fall back to float32.
+    dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float32
     model = LitEncDecTransformer.load_from_checkpoint(
         checkpoint_path=args.checkpoint_path
     ).to(device=args.device, dtype=torch.bfloat16)
