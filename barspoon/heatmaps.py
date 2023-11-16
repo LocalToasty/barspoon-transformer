@@ -71,9 +71,11 @@ def main():
     # Load model and ensure its version is compatible
     # We do all computations in bfloat16, as it needs way less VRAM and performs
     # virtually identical to float32 in inference tasks.
+    # If no GPU support for bfloat16 is available, fall back to float32.
+    dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float32
     model = LitEncDecTransformer.load_from_checkpoint(
         checkpoint_path=args.checkpoint_path
-    ).to(device=args.device, dtype=torch.bfloat16)
+    ).to(device=args.device, dtype=dtype)
     name, version = model.hparams.get("version", "undefined 0").split(" ")
     if not (
         name == "barspoon-transformer"
@@ -101,7 +103,7 @@ def main():
         # Load features
         with h5py.File(h5_path) as h5_file:
             feats: Float[Tensor, "n_tiles d_feats"] = torch.tensor(
-                h5_file["feats"][:], dtype=torch.bfloat16, device=args.device
+                h5_file["feats"][:], dtype=dtype, device=args.device
             )
             coords: Int[Tensor, "n_tiles 2"] = torch.tensor(h5_file["coords"][:])
             xs = np.sort(np.unique(coords[:, 0]))
