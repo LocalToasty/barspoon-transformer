@@ -36,45 +36,7 @@ dependencies = [
 "Bug Tracker" = "https://github.com/KatherLab/barspoon-transformer/issues"
 
 [tool.hatch.build.targets.wheel]
-packages = ["barspoon"]
-
-[build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
-
-[project]
-name = "barspoon-transformer"
-version = "2.2.0"
-requires-python = ">=3.10"
-authors = [
-    { name="Marko van Treeck", email="markovantreeck@gmail.com" },
-]
-description = "A transformer architecture for histopathological images"
-readme = "README.md"
-classifiers = [
-    "Programming Language :: Python :: 3",
-    "Operating System :: POSIX :: Linux",
-    "License :: OSI Approved :: GNU General Public License v3 (GPLv3)",
-]
-dependencies = [
-    "h5py~=3.8",
-    "jaxtyping~=0.2.21",
-    "matplotlib~=3.7",
-    "numpy~=1.24",
-    "openpyxl~=3.1",
-    "packaging~=23.1",
-    "pandas~=2.0",
-    "scikit-learn~=1.2",
-    "tomli~=2.0",   # replace with stdlib `tomllib` once 3.11 becomes necessary
-    "torch~=2.0",
-    "torchmetrics~=0.11.4",
-    "pytorch-lightning~=2.0",
-]
-
-[project.urls]
-"Homepage" = "https://github.com/KatherLab/barspoon-transformer"
-"Bug Tracker" = "https://github.com/KatherLab/barspoon-transformer/issues"
-
+packages = ["js_asset"]
 
 [project.scripts]
 "barspoon-train" = "barspoon.train:main"
