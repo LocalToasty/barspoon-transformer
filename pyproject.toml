@@ -36,7 +36,7 @@ dependencies = [
 "Bug Tracker" = "https://github.com/KatherLab/barspoon-transformer/issues"
 
 [tool.hatch.build.targets.wheel]
-packages = ["js_asset"]
+packages = ["barspoon"]
 
 [project.scripts]
 "barspoon-train" = "barspoon.train:main"
