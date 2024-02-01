@@ -51,6 +51,7 @@ import h5py
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+import openslide
 from jaxtyping import Float, Int
 from packaging.specifiers import SpecifierSet
 from PIL import Image
@@ -68,6 +69,9 @@ def main():
     parser = make_argument_parser()
     args = parser.parse_args()
 
+    if args.top and not args.wsi_dir:
+        parser.error("--top requires --wsi-dir")
+
     # Load model and ensure its version is compatible
     # We do all computations in bfloat16, as it needs way less VRAM and performs
     # virtually identical to float32 in inference tasks.
@@ -84,20 +88,11 @@ def main():
             model.hparams["version"],
         )
 
-    target_labels = model.hparams["target_labels"]
+    h5_paths = [h5 for d in args.feature_dirs for h5 in d.glob("*.h5")]
+    if args.slides:
+        h5_paths = [h5 for h5 in h5_paths if h5.stem in args.slides]
 
-    # Load dataset, grouped by filename
-    dataset_df = make_dataset_df(
-        feature_dirs=args.feature_dirs,
-        target_labels=target_labels,
-    )
-
-    for slides in tqdm(dataset_df.path):
-        assert (
-            len(slides) == 1
-        ), "there should only be one slide per item after grouping by slidename"
-        h5_path = slides[0]
-
+    for h5_path in tqdm(h5_paths):
         # Load features
         with h5py.File(h5_path) as h5_file:
             feats: Float[Tensor, "n_tiles d_feats"] = torch.tensor(
@@ -108,6 +103,9 @@ def main():
             stride = np.min(xs[1:] - xs[:-1])
 
         categories = model.hparams["categories"]
+
+        if len(args.targets):
+            categories = {k: v for k, v in categories.items() if k in args.targets}
 
         # Generate the gradcams
         # Skip the slide if we are out of memory
@@ -154,7 +152,7 @@ def main():
                 device="cpu",
             )
         except torch.cuda.OutOfMemoryError as oom_error:  # type: ignore
-            logging.error(f"error while processing {slides[0]}: {oom_error})")
+            logging.error(f"error while processing {h5_path}: {oom_error})")
             continue
 
         for target_label, category_labels in categories.items():
@@ -204,12 +202,72 @@ def main():
                 sanitized_pos_cat_label = re.sub(
                     r"[^()\-.0-9;A-Z\[\]^_a-z]", "_", pos_category_label
                 )
+                filename = f"{h5_path.stem}-{target_label}-{sanitized_pos_cat_label}={overall_scores[target_label][0,cat_idx]:1.2f}"
                 Image.fromarray(np.uint8(score_im * 255)).resize(
                     np.array(score_im.shape[:2][::-1]) * 8, resample=Image.NEAREST
                 ).save(
                     target_dir
-                    / f"scores-{h5_path.stem}-{target_label}-{sanitized_pos_cat_label}={overall_scores[target_label][0,cat_idx]:1.2f}.png"
+                    / f"scores-{filename}.png"
                 )
+
+                if args.top:
+                    slide_url = args.wsi_dir.glob(f"{h5_path.stem}.*")
+                    if not (slide_url := next(slide_url, None)):
+                        logging.error(f"could not find slide for {h5_path.stem}, skipping top tiles extraction...")
+                        continue
+                    logging.info(f"extracting top tiles for {h5_path.stem}...")
+                    slide = openslide.open_slide(slide_url)
+                    get_n_toptiles(
+                        slide=slide,
+                        stride=stride,
+                        output_dir=target_dir / f"top-{filename}",
+                        scores=scores[target_label][pos_category_label],
+                        coords=coords,
+                        n=args.top
+                    )
+
+
+def get_n_toptiles(
+    slide,
+    stride: int,
+    output_dir: Path,
+    scores: Mapping[TargetLabel, Float[Tensor, "n_tiles cat_classes"]],
+    coords: Int[Tensor, "n_tiles 2"],
+    n: int
+):
+    slide_mpp = float(slide.properties[openslide.PROPERTY_NAME_MPP_X])
+    output_dir.mkdir(exist_ok=True, parents=True)
+
+    # determine the scaling factor between heatmap and original slide
+    # 256 microns edge length by default, with 224px = ~1.14 MPP (± 10x magnification)
+    feature_downsample_mpp = (
+        256 / stride
+    )  # NOTE: stride here only makes sense if the tiles were NON-OVERLAPPING
+    scaling_factor = feature_downsample_mpp / slide_mpp
+
+    top_score, bottom_score = scores.topk(n), scores.topk(n, largest=False)
+
+    for label, score in zip(["top", "bottom"], [top_score, bottom_score]):
+        # OPTIONAL: if the score is not larger than 0.5, it's indecisive on directionality
+        # then add [top_score.values > 0.5]
+        top_coords_downscaled = coords[score.indices]
+        top_coords_original = np.uint(top_coords_downscaled * scaling_factor)
+
+        # NOTE: target size (stride, stride) only works for NON-OVERLAPPING tiles
+        # that were extracted in previous steps.
+        for score_idx, pos in enumerate(top_coords_original):
+            tile = (
+                slide.read_region(
+                    (pos[0], pos[1]),
+                    0,
+                    (np.uint(stride * scaling_factor), np.uint(stride * scaling_factor)),
+                )
+                .convert("RGB")
+                .resize((stride, stride))
+            )
+            tile.save(
+                (output_dir / f"{label}_{score_idx + 1}_{score.values[score_idx]:.2f}_{(pos[0], pos[1])}.jpg")
+            )
 
 
 def compute_gradcams(
@@ -344,6 +402,36 @@ def make_argument_parser() -> argparse.ArgumentParser:
         type=Path,
         required=True,
         help="Path to the checkpoint file",
+    )
+
+    parser.add_argument(
+        "-t",
+        "--targets",
+        action='append',
+        default=[],
+        help="Targets to generate heatmaps for",
+    )
+
+    parser.add_argument(
+        "-s",
+        "--slides",
+        action='append',
+        default=[],
+        help="Slides to generate heatmaps for (stem of the h5 file)",
+    )
+
+    parser.add_argument(
+        "-w",
+        "--wsi-dir",
+        type=Path,
+        help="Path containing WSI images for top tile extraction",
+    )
+
+    parser.add_argument(
+        "--top",
+        default=0,
+        type=int,
+        help="How many top / bottom tiles to generate (default: 0)",
     )
 
     parser.add_argument("--batch-size", type=int, default=0x20)

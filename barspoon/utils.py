@@ -23,7 +23,7 @@ def make_dataset_df(
     patient_col: str = "patient",
     filename_col: str = "filename",
     group_by: Optional[str] = None,
-    target_labels: Sequence[str],
+    target_labels: Sequence[str] = [],
 ) -> pd.DataFrame:
     if slide_tables:
         slide_dfs = []
