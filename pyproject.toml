@@ -3,8 +3,8 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "barspoon-transformer"
-version = "2.2.0"
+name = "barspoon"
+version = "2.3.0"
 requires-python = ">=3.10"
 authors = [
     { name="Marko van Treeck", email="markovantreeck@gmail.com" },

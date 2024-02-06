@@ -50,8 +50,8 @@ from typing import Mapping, Sequence
 import h5py
 import matplotlib.pyplot as plt
 import numpy as np
-import torch
 import openslide
+import torch
 from jaxtyping import Float, Int
 from packaging.specifiers import SpecifierSet
 from PIL import Image
@@ -100,7 +100,7 @@ def main():
             )
             coords: Int[Tensor, "n_tiles 2"] = torch.tensor(h5_file["coords"][:])
             xs = np.sort(np.unique(coords[:, 0]))
-            stride = np.min(xs[1:] - xs[:-1])
+            stride_wsi_px = np.min(xs[1:] - xs[:-1])
 
         categories = model.hparams["categories"]
 
@@ -183,13 +183,16 @@ def main():
                 )
 
                 category_support_2d = (
-                    vals_to_im(category_support, coords // stride)
+                    vals_to_im(category_support, coords // stride_wsi_px)
                     .detach()
                     .cpu()
                     .float()
                 )
                 attention_2d = (
-                    vals_to_im(attention, coords // stride).detach().cpu().float()
+                    vals_to_im(attention, coords // stride_wsi_px)
+                    .detach()
+                    .cpu()
+                    .float()
                 )
 
                 score_im = plt.get_cmap("RdBu")(
@@ -205,68 +208,56 @@ def main():
                 filename = f"{h5_path.stem}-{target_label}-{sanitized_pos_cat_label}={overall_scores[target_label][0,cat_idx]:1.2f}"
                 Image.fromarray(np.uint8(score_im * 255)).resize(
                     np.array(score_im.shape[:2][::-1]) * 8, resample=Image.NEAREST
-                ).save(
-                    target_dir
-                    / f"scores-{filename}.png"
-                )
+                ).save(target_dir / f"scores-{filename}.png")
 
                 if args.top:
                     slide_url = args.wsi_dir.glob(f"{h5_path.stem}.*")
                     if not (slide_url := next(slide_url, None)):
-                        logging.error(f"could not find slide for {h5_path.stem}, skipping top tiles extraction...")
+                        logging.error(
+                            f"could not find slide for {h5_path.stem}, skipping top tiles extraction..."
+                        )
                         continue
                     logging.info(f"extracting top tiles for {h5_path.stem}...")
                     slide = openslide.open_slide(slide_url)
                     get_n_toptiles(
                         slide=slide,
-                        stride=stride,
+                        stride_wsi_px=stride_wsi_px,
                         output_dir=target_dir / f"top-{filename}",
                         scores=scores[target_label][pos_category_label],
-                        coords=coords,
-                        n=args.top
+                        coords_wsi_px=coords,
+                        n=args.top,
                     )
 
 
 def get_n_toptiles(
     slide,
-    stride: int,
+    stride_wsi_px: int,
     output_dir: Path,
     scores: Mapping[TargetLabel, Float[Tensor, "n_tiles cat_classes"]],
-    coords: Int[Tensor, "n_tiles 2"],
-    n: int
+    coords_wsi_px: Int[Tensor, "n_tiles 2"],
+    n: int,
 ):
-    slide_mpp = float(slide.properties[openslide.PROPERTY_NAME_MPP_X])
     output_dir.mkdir(exist_ok=True, parents=True)
-
-    # determine the scaling factor between heatmap and original slide
-    # 256 microns edge length by default, with 224px = ~1.14 MPP (± 10x magnification)
-    feature_downsample_mpp = (
-        256 / stride
-    )  # NOTE: stride here only makes sense if the tiles were NON-OVERLAPPING
-    scaling_factor = feature_downsample_mpp / slide_mpp
-
     top_score, bottom_score = scores.topk(n), scores.topk(n, largest=False)
 
     for label, score in zip(["top", "bottom"], [top_score, bottom_score]):
         # OPTIONAL: if the score is not larger than 0.5, it's indecisive on directionality
         # then add [top_score.values > 0.5]
-        top_coords_downscaled = coords[score.indices]
-        top_coords_original = np.uint(top_coords_downscaled * scaling_factor)
+        top_coords_px = coords_wsi_px[score.indices]
 
         # NOTE: target size (stride, stride) only works for NON-OVERLAPPING tiles
         # that were extracted in previous steps.
-        for score_idx, pos in enumerate(top_coords_original):
-            tile = (
-                slide.read_region(
-                    (pos[0], pos[1]),
-                    0,
-                    (np.uint(stride * scaling_factor), np.uint(stride * scaling_factor)),
-                )
-                .convert("RGB")
-                .resize((stride, stride))
-            )
+        for score_idx, pos in enumerate(top_coords_px):
+            tile = slide.read_region(
+                (pos[0], pos[1]),
+                0,
+                (stride_wsi_px, stride_wsi_px),
+            ).convert("RGB")
             tile.save(
-                (output_dir / f"{label}_{score_idx + 1}_{score.values[score_idx]:.2f}_{(pos[0], pos[1])}.jpg")
+                (
+                    output_dir
+                    / f"{label}_{score_idx + 1}_{score.values[score_idx]:.2f}_{(pos[0].item(), pos[1].item())}.jpg"
+                )
             )
 
 
@@ -407,7 +398,7 @@ def make_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "-t",
         "--targets",
-        action='append',
+        action="append",
         default=[],
         help="Targets to generate heatmaps for",
     )
@@ -415,7 +406,7 @@ def make_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "-s",
         "--slides",
-        action='append',
+        action="append",
         default=[],
         help="Slides to generate heatmaps for (stem of the h5 file)",
     )
